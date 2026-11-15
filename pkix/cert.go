@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -84,12 +85,13 @@ func (c *Certificate) GetRawCertificate() (*x509.Certificate, error) {
 	return c.crt, nil
 }
 
-// GetExpirationDuration gets time duration before expiration
-func (c *Certificate) GetExpirationDuration() time.Duration {
+// GetExpirationDuration gets time duration before expiration.
+// It returns an error if the certificate cannot be parsed.
+func (c *Certificate) GetExpirationDuration() (time.Duration, error) {
 	if err := c.buildX509Certificate(); err != nil {
-		return time.Until(time.Unix(0, 0))
+		return 0, err
 	}
-	return time.Until(c.crt.NotAfter)
+	return time.Until(c.crt.NotAfter), nil
 }
 
 // CheckAuthority checks the authority of certificate against itself.
@@ -117,7 +119,6 @@ func (c *Certificate) VerifyHost(hostCert *Certificate, name string) error {
 	roots.AddCert(c.crt)
 
 	verifyOpts := x509.VerifyOptions{
-		DNSName: "",
 		// no intermediates are allowed for now
 		Intermediates: nil,
 		Roots:         roots,
@@ -132,9 +133,13 @@ func (c *Certificate) VerifyHost(hostCert *Certificate, name string) error {
 		return err
 	}
 
-	units := rawHostCrt.Subject.OrganizationalUnit
-	if len(units) != 1 || units[0] != name {
-		return fmt.Errorf("unmatched hostname between %v and %v", units, name)
+	// Hostname validation is bound to the Subject Alternative Name extension.
+	// Certificates without any SAN fall back to the legacy Common Name for
+	// compatibility. The Organizational Unit is never treated as a hostname.
+	if hasSubjectAltName(rawHostCrt) {
+		verifyOpts.DNSName = name
+	} else if !strings.EqualFold(rawHostCrt.Subject.CommonName, name) {
+		return fmt.Errorf("unmatched hostname %q against Common Name %q", name, rawHostCrt.Subject.CommonName)
 	}
 
 	chains, err := rawHostCrt.Verify(verifyOpts)
@@ -145,6 +150,13 @@ func (c *Certificate) VerifyHost(hostCert *Certificate, name string) error {
 		return errors.New("internal error: verify chain number != 1")
 	}
 	return nil
+}
+
+// hasSubjectAltName reports whether the certificate carries any Subject
+// Alternative Name entry (DNS name, IP address, email address or URI).
+func hasSubjectAltName(crt *x509.Certificate) bool {
+	return len(crt.DNSNames) > 0 || len(crt.IPAddresses) > 0 ||
+		len(crt.EmailAddresses) > 0 || len(crt.URIs) > 0
 }
 
 // Export returns PEM-format bytes

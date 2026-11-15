@@ -43,9 +43,6 @@ func TestCreateCertificateHost(t *testing.T) {
 	if err != nil {
 		t.Fatal("Failed creating certificate for host:", err)
 	}
-	if crt.GetExpirationDuration() > crtAuth.GetExpirationDuration() {
-		t.Fatal("Cert expires after issuer")
-	}
 	rawCrt, err := crt.GetRawCertificate()
 	if err != nil {
 		t.Fatal("Failed to get x509.Certificate:", err)
@@ -62,6 +59,17 @@ func TestCreateCertificateHost(t *testing.T) {
 	rawCrtAuth, err := crtAuth.GetRawCertificate()
 	if err != nil {
 		t.Fatal("Failed to get x509.Certificate:", err)
+	}
+	if _, err := crt.GetExpirationDuration(); err != nil {
+		t.Fatal("Failed to get host cert expiration duration:", err)
+	}
+	if _, err := crtAuth.GetExpirationDuration(); err != nil {
+		t.Fatal("Failed to get CA expiration duration:", err)
+	}
+	// Compare absolute expiry timestamps: durations derived from separate
+	// time.Now() calls differ by the elapsed wall-clock time.
+	if rawCrt.NotAfter.After(rawCrtAuth.NotAfter) {
+		t.Fatal("Cert expires after issuer")
 	}
 	if err = rawCrt.CheckSignatureFrom(rawCrtAuth); err != nil {
 		t.Fatal("Failed to check signature:", err)

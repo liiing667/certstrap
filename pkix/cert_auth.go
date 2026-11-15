@@ -104,7 +104,11 @@ func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, key
 
 	authTemplate.RawSubject = rawCsr.RawSubject
 
-	caExpiry := time.Now().Add(crtAuth.GetExpirationDuration())
+	caExpiryDuration, err := crtAuth.GetExpirationDuration()
+	if err != nil {
+		return nil, err
+	}
+	caExpiry := time.Now().Add(caExpiryDuration)
 	// ensure cert doesn't expire after issuer
 	if caExpiry.Before(proposedExpiry) {
 		authTemplate.NotAfter = caExpiry

@@ -19,6 +19,7 @@ package pkix
 
 import (
 	"bytes"
+	"net"
 	"testing"
 	"time"
 )
@@ -132,7 +133,10 @@ func TestCertificateAuthority(t *testing.T) {
 		t.Fatal("Failed to verify CA:", err)
 	}
 
-	duration := crt.GetExpirationDuration()
+	duration, err := crt.GetExpirationDuration()
+	if err != nil {
+		t.Fatal("Failed to get expiration duration:", err)
+	}
 	expireDate, _ := time.Parse("2006-Jan-02", "2024-Feb-03")
 	if !time.Now().Add(duration).After(expireDate) {
 		t.Fatal("Failed to get correct expiration")
@@ -175,8 +179,8 @@ func TestBadCertificate(t *testing.T) {
 		t.Fatal("Expect not to get x509.Certificate")
 	}
 
-	if duration := crt.GetExpirationDuration(); duration.Hours() >= 0 {
-		t.Fatal("Expect not to get positive duration")
+	if _, err := crt.GetExpirationDuration(); err == nil {
+		t.Fatal("Expect GetExpirationDuration to fail on unparsable certificate")
 	}
 
 	pemBytes, err := crt.Export()
@@ -201,5 +205,132 @@ func TestCertificateVerify(t *testing.T) {
 
 	if err = crtAuth.VerifyHost(crtHost, csrHostname); err != nil {
 		t.Fatal("Verify certificate host from CA:", err)
+	}
+}
+
+// signHostCSR creates a host certificate signed by the given CA for the
+// provided CSR, mirroring the sign workflow without touching the CLI layer.
+func signHostCSR(t *testing.T, crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest) *Certificate {
+	t.Helper()
+	hostCrt, err := CreateCertificateHost(crtAuth, keyAuth, csr, time.Now().AddDate(1, 0, 0))
+	if err != nil {
+		t.Fatal("Failed creating host certificate:", err)
+	}
+	return hostCrt
+}
+
+// TestVerifyHostSANBinding ensures hostname validation is bound to the SAN
+// extension and never to the Organizational Unit field.
+func TestVerifyHostSANBinding(t *testing.T) {
+	caKey, err := CreateRSAKey(rsaBits)
+	if err != nil {
+		t.Fatal("Failed creating CA key:", err)
+	}
+	crtAuth, err := CreateCertificateAuthority(caKey, "CA", time.Now().AddDate(10, 0, 0), "etcd-ca", "US", "", "", "CA", nil)
+	if err != nil {
+		t.Fatal("Failed creating CA:", err)
+	}
+
+	hostKey, err := CreateRSAKey(rsaBits)
+	if err != nil {
+		t.Fatal("Failed creating host key:", err)
+	}
+
+	// SAN is a.example while the OU (b.example) and CN do not carry the SAN.
+	csr, err := CreateCertificateSigningRequest(hostKey, "b.example", nil, []string{"a.example"}, nil, "etcd-ca", "US", "", "", "a.example")
+	if err != nil {
+		t.Fatal("Failed creating CSR:", err)
+	}
+	hostCrt := signHostCSR(t, crtAuth, caKey, csr)
+
+	// Matching SAN succeeds even though the OU differs.
+	if err := crtAuth.VerifyHost(hostCrt, "a.example"); err != nil {
+		t.Fatal("Expected SAN hostname a.example to verify:", err)
+	}
+
+	// An OU-only match must not pass hostname validation.
+	if err := crtAuth.VerifyHost(hostCrt, "b.example"); err == nil {
+		t.Fatal("Expected OU-only hostname b.example to be rejected")
+	}
+
+	// An unrelated hostname must be rejected as well.
+	if err := crtAuth.VerifyHost(hostCrt, "c.example"); err == nil {
+		t.Fatal("Expected unrelated hostname c.example to be rejected")
+	}
+}
+
+// TestVerifyHostCNFallback exercises the legacy Common Name fallback used
+// when a certificate carries no Subject Alternative Name extension.
+func TestVerifyHostCNFallback(t *testing.T) {
+	caKey, err := CreateRSAKey(rsaBits)
+	if err != nil {
+		t.Fatal("Failed creating CA key:", err)
+	}
+	crtAuth, err := CreateCertificateAuthority(caKey, "CA", time.Now().AddDate(10, 0, 0), "etcd-ca", "US", "", "", "CA", nil)
+	if err != nil {
+		t.Fatal("Failed creating CA:", err)
+	}
+
+	hostKey, err := CreateRSAKey(rsaBits)
+	if err != nil {
+		t.Fatal("Failed creating host key:", err)
+	}
+
+	// No SANs: CN holds the hostname, OU holds an unrelated value.
+	csr, err := CreateCertificateSigningRequest(hostKey, "b.example", nil, nil, nil, "etcd-ca", "US", "", "", "a.example")
+	if err != nil {
+		t.Fatal("Failed creating CSR:", err)
+	}
+	hostCrt := signHostCSR(t, crtAuth, caKey, csr)
+
+	if err := crtAuth.VerifyHost(hostCrt, "a.example"); err != nil {
+		t.Fatal("Expected CN fallback hostname a.example to verify:", err)
+	}
+	if err := crtAuth.VerifyHost(hostCrt, "b.example"); err == nil {
+		t.Fatal("Expected OU-only hostname b.example to be rejected without SANs")
+	}
+}
+
+// TestVerifyHostIPSAN ensures IP literal hostnames are matched against the
+// IP entries of the SAN extension.
+func TestVerifyHostIPSAN(t *testing.T) {
+	caKey, err := CreateRSAKey(rsaBits)
+	if err != nil {
+		t.Fatal("Failed creating CA key:", err)
+	}
+	crtAuth, err := CreateCertificateAuthority(caKey, "CA", time.Now().AddDate(10, 0, 0), "etcd-ca", "US", "", "", "CA", nil)
+	if err != nil {
+		t.Fatal("Failed creating CA:", err)
+	}
+
+	hostKey, err := CreateRSAKey(rsaBits)
+	if err != nil {
+		t.Fatal("Failed creating host key:", err)
+	}
+
+	csr, err := CreateCertificateSigningRequest(hostKey, "b.example", []net.IP{net.ParseIP("127.0.0.1")}, nil, nil, "etcd-ca", "US", "", "", "127.0.0.1")
+	if err != nil {
+		t.Fatal("Failed creating CSR:", err)
+	}
+	hostCrt := signHostCSR(t, crtAuth, caKey, csr)
+
+	if err := crtAuth.VerifyHost(hostCrt, "127.0.0.1"); err != nil {
+		t.Fatal("Expected IP SAN 127.0.0.1 to verify:", err)
+	}
+	if err := crtAuth.VerifyHost(hostCrt, "b.example"); err == nil {
+		t.Fatal("Expected OU-only hostname b.example to be rejected for an IP SAN cert")
+	}
+}
+
+// TestGetExpirationDurationParseError ensures parse failures surface as
+// errors instead of a silently negative duration.
+func TestGetExpirationDurationParseError(t *testing.T) {
+	crt, err := NewCertificateFromPEM([]byte(badCertAuthPEM))
+	if err != nil {
+		t.Fatal("Failed to parse certificate from PEM:", err)
+	}
+
+	if _, err := crt.GetExpirationDuration(); err == nil {
+		t.Fatal("Expected GetExpirationDuration to return an error for an invalid certificate")
 	}
 }
