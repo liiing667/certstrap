@@ -99,7 +99,68 @@ func (c *Certificate) CheckAuthority() error {
 	if err := c.buildX509Certificate(); err != nil {
 		return err
 	}
-	return c.crt.CheckSignatureFrom(c.crt)
+	if err := c.crt.CheckSignatureFrom(c.crt); err != nil {
+		return fmt.Errorf("certificate %q is not a self-signed authority: %w", c.crt.Subject.CommonName, err)
+	}
+	return nil
+}
+
+// CheckSignatureFrom verifies that c is issued by parent. It checks the issuer
+// name, the AuthorityKeyId binding and the certificate signature so a leaf
+// cannot be accepted with an issuer identity that differs from the signer.
+func (c *Certificate) CheckSignatureFrom(parent *Certificate) error {
+	if parent == nil {
+		return errors.New("issuer certificate is missing")
+	}
+	if err := c.buildX509Certificate(); err != nil {
+		return err
+	}
+	if err := parent.buildX509Certificate(); err != nil {
+		return err
+	}
+
+	if !bytes.Equal(c.crt.RawIssuer, parent.crt.RawSubject) {
+		return fmt.Errorf(
+			"certificate issuer %q does not match CA subject %q",
+			c.crt.Issuer.String(), parent.crt.Subject.String(),
+		)
+	}
+
+	// A root certificate is self-issued and does not normally carry an
+	// AuthorityKeyId, so only bind the key identifier for a distinct child.
+	selfIssued := bytes.Equal(c.derBytes, parent.derBytes)
+	if !selfIssued && len(parent.crt.SubjectKeyId) > 0 {
+		if !bytes.Equal(c.crt.AuthorityKeyId, parent.crt.SubjectKeyId) {
+			return fmt.Errorf(
+				"certificate authority key identifier %x does not match CA subject key identifier %x",
+				c.crt.AuthorityKeyId, parent.crt.SubjectKeyId,
+			)
+		}
+	} else if !selfIssued && len(c.crt.AuthorityKeyId) > 0 {
+		expected, err := GenerateSubjectKeyID(parent.crt.PublicKey)
+		if err != nil {
+			return fmt.Errorf("derive CA authority key identifier: %w", err)
+		}
+		if !bytes.Equal(c.crt.AuthorityKeyId, expected) {
+			return fmt.Errorf(
+				"certificate authority key identifier %x does not match CA public key identifier %x",
+				c.crt.AuthorityKeyId, expected,
+			)
+		}
+	}
+
+	if err := c.crt.CheckSignatureFrom(parent.crt); err != nil {
+		return fmt.Errorf("certificate signature does not verify against CA %q: %w", parent.crt.Subject.CommonName, err)
+	}
+	return nil
+}
+
+// Equal reports whether two certificates contain the same DER bytes.
+func (c *Certificate) Equal(other *Certificate) bool {
+	if c == nil || other == nil {
+		return c == other
+	}
+	return bytes.Equal(c.derBytes, other.derBytes)
 }
 
 // VerifyHost verifies the host certificate using host name.

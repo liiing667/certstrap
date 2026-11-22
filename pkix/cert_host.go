@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"math/big"
 	"time"
 )
@@ -28,6 +29,15 @@ import (
 // CreateCertificateHost creates certificate for host.
 // The arguments include CA certificate, CA key, certificate request.
 func CreateCertificateHost(crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest, proposedExpiry time.Time) (*Certificate, error) {
+	authority, err := authorityForSigning(crtAuth, keyAuth)
+	if err != nil {
+		return nil, err
+	}
+	rawCrtAuth := authority.RawCertificate()
+	if csr == nil {
+		return nil, errors.New("certificate signing request is missing")
+	}
+
 	// Build CA based on RFC5280
 	hostTemplate := x509.Certificate{
 		// **SHOULD** be filled in a unique number
@@ -78,7 +88,7 @@ func CreateCertificateHost(crtAuth *Certificate, keyAuth *Key, csr *CertificateS
 	// RawSubject has a value.
 	hostTemplate.RawSubject = rawCsr.RawSubject
 
-	caExpiry := time.Now().Add(crtAuth.GetExpirationDuration())
+	caExpiry := rawCrtAuth.NotAfter
 	// ensure cert doesn't expire after issuer
 	if caExpiry.Before(proposedExpiry) {
 		hostTemplate.NotAfter = caExpiry
@@ -94,16 +104,16 @@ func CreateCertificateHost(crtAuth *Certificate, keyAuth *Key, csr *CertificateS
 	hostTemplate.IPAddresses = rawCsr.IPAddresses
 	hostTemplate.DNSNames = rawCsr.DNSNames
 	hostTemplate.URIs = rawCsr.URIs
+	hostTemplate.AuthorityKeyId = authority.AuthorityKeyID()
 
-	rawCrtAuth, err := crtAuth.GetRawCertificate()
+	crtHostBytes, err := x509.CreateCertificate(rand.Reader, &hostTemplate, rawCrtAuth, rawCsr.PublicKey, authority.Signer())
 	if err != nil {
 		return nil, err
 	}
 
-	crtHostBytes, err := x509.CreateCertificate(rand.Reader, &hostTemplate, rawCrtAuth, rawCsr.PublicKey, keyAuth.Private)
-	if err != nil {
+	crtHost := NewCertificateFromDER(crtHostBytes)
+	if err := authority.VerifyIssuedCertificate(crtHost, false); err != nil {
 		return nil, err
 	}
-
-	return NewCertificateFromDER(crtHostBytes), nil
+	return crtHost, nil
 }

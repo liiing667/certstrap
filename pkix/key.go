@@ -105,7 +105,11 @@ func NewKeyFromPrivateKeyPEM(data []byte) (*Key, error) {
 		if err != nil {
 			return nil, err
 		}
-		signer = priv.(crypto.Signer)
+		parsedSigner, ok := priv.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("unsupported private key type %T", priv)
+		}
+		signer = parsedSigner
 	default:
 		return nil, fmt.Errorf("unknown PEM block type %q", pemBlock.Type)
 	}
@@ -139,7 +143,11 @@ func NewKeyFromEncryptedPrivateKeyPEM(data []byte, password []byte) (*Key, error
 		if err != nil {
 			return nil, err
 		}
-		signer = priv.(crypto.Signer)
+		parsedSigner, ok := priv.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("unsupported private key type %T", priv)
+		}
+		signer = parsedSigner
 	default:
 		return nil, fmt.Errorf("unsupported PEM block type %q", pemBlock.Type)
 	}

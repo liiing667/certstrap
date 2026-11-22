@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 
 	"github.com/howeyc/gopass"
 	"github.com/square/certstrap/depot"
@@ -83,9 +85,59 @@ func putCertificate(c *cli.Context, d *depot.FileDepot, name string, crt *pkix.C
 		if err != nil {
 			return err
 		}
-		return os.WriteFile(c.String("cert"), bytes, depot.LeafPerm)
+		return writeFileAtomic(c.String("cert"), bytes, depot.LeafPerm)
 	}
 	return depot.PutCertificate(d, name, crt)
+}
+
+// writeFileAtomic writes data to path without exposing a partially written
+// file. The temporary file is created next to the destination so a rename is
+// atomic on the same filesystem.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	mode := perm
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() {
+			// Preserve the legacy behavior for devices, FIFOs and symlinks;
+			// atomic replacement only applies to regular files.
+			return os.WriteFile(path, data, perm)
+		}
+		mode = info.Mode().Perm()
+	}
+
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmpName, path); err != nil {
+		if runtime.GOOS != "windows" {
+			return err
+		}
+		// Windows does not replace an existing file with Rename.
+		if info, statErr := os.Stat(path); statErr == nil && !info.IsDir() {
+			if removeErr := os.Remove(path); removeErr != nil {
+				return err
+			}
+			return os.Rename(tmpName, path)
+		}
+		return err
+	}
+	return nil
 }
 
 func putCertificateSigningRequest(c *cli.Context, d *depot.FileDepot, name string, csr *pkix.CertificateSigningRequest) error {

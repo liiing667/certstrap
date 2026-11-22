@@ -20,6 +20,8 @@ package pkix
 import (
 	"crypto/rand"
 	"crypto/x509"
+	"errors"
+	"fmt"
 	"math/big"
 	"time"
 )
@@ -38,7 +40,11 @@ func CreateCertificateAuthority(key *Key, organizationalUnit string, expiry time
 func CreateCertificateAuthorityWithOptions(key *Key, organizationalUnit string, expiry time.Time, organization string, country string, province string, locality string, commonName string, permitDomains []string, opts ...Option) (*Certificate, error) {
 	authTemplate := newAuthTemplate()
 
-	subjectKeyID, err := GenerateSubjectKeyID(key.Public)
+	signer, public, err := signerAndPublicKey(key)
+	if err != nil {
+		return nil, err
+	}
+	subjectKeyID, err := GenerateSubjectKeyID(public)
 	if err != nil {
 		return nil, err
 	}
@@ -70,12 +76,16 @@ func CreateCertificateAuthorityWithOptions(key *Key, organizationalUnit string, 
 
 	applyOptions(&authTemplate, opts)
 
-	crtBytes, err := x509.CreateCertificate(rand.Reader, &authTemplate, &authTemplate, key.Public, key.Private)
+	crtBytes, err := x509.CreateCertificate(rand.Reader, &authTemplate, &authTemplate, public, signer)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewCertificateFromDER(crtBytes), nil
+	crt := NewCertificateFromDER(crtBytes)
+	if err := crt.CheckAuthority(); err != nil {
+		return nil, fmt.Errorf("created CA certificate is not self-consistent: %w", err)
+	}
+	return crt, nil
 }
 
 // CreateIntermediateCertificateAuthority creates an intermediate
@@ -88,6 +98,15 @@ func CreateIntermediateCertificateAuthority(crtAuth *Certificate, keyAuth *Key, 
 // CreateIntermediateCertificateAuthorityWithOptions creates an intermediate with options.
 // CA certificate signed by the given authority.
 func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest, proposedExpiry time.Time, opts ...Option) (*Certificate, error) {
+	authority, err := authorityForSigning(crtAuth, keyAuth)
+	if err != nil {
+		return nil, err
+	}
+	rawCrtAuth := authority.RawCertificate()
+	if csr == nil {
+		return nil, errors.New("certificate signing request is missing")
+	}
+
 	authTemplate := newAuthTemplate()
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
@@ -104,7 +123,7 @@ func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, key
 
 	authTemplate.RawSubject = rawCsr.RawSubject
 
-	caExpiry := time.Now().Add(crtAuth.GetExpirationDuration())
+	caExpiry := rawCrtAuth.NotAfter
 	// ensure cert doesn't expire after issuer
 	if caExpiry.Before(proposedExpiry) {
 		authTemplate.NotAfter = caExpiry
@@ -120,20 +139,20 @@ func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, key
 	authTemplate.IPAddresses = rawCsr.IPAddresses
 	authTemplate.DNSNames = rawCsr.DNSNames
 	authTemplate.URIs = rawCsr.URIs
-
-	rawCrtAuth, err := crtAuth.GetRawCertificate()
-	if err != nil {
-		return nil, err
-	}
+	authTemplate.AuthorityKeyId = authority.AuthorityKeyID()
 
 	applyOptions(&authTemplate, opts)
 
-	crtOutBytes, err := x509.CreateCertificate(rand.Reader, &authTemplate, rawCrtAuth, rawCsr.PublicKey, keyAuth.Private)
+	crtOutBytes, err := x509.CreateCertificate(rand.Reader, &authTemplate, rawCrtAuth, rawCsr.PublicKey, authority.Signer())
 	if err != nil {
 		return nil, err
 	}
 
-	return NewCertificateFromDER(crtOutBytes), nil
+	crtOut := NewCertificateFromDER(crtOutBytes)
+	if err := authority.VerifyIssuedCertificate(crtOut, true); err != nil {
+		return nil, err
+	}
+	return crtOut, nil
 }
 
 // WithPathlenOption will check if the certificate should have `pathlen` or not.

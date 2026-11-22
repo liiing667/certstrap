@@ -18,6 +18,9 @@
 package depot
 
 import (
+	"crypto"
+	"encoding/pem"
+	"fmt"
 	"strings"
 
 	"github.com/square/certstrap/pkix"
@@ -93,6 +96,36 @@ func GetCertificate(d Depot, name string) (crt *pkix.Certificate, err error) {
 	return pkix.NewCertificateFromPEM(b)
 }
 
+// GetCertificateAuthority retrieves the CA certificate and private key for a
+// given name and verifies that they describe one signing identity. The
+// validated identity is returned so callers do not accidentally pair a
+// certificate with a later key rotation.
+func GetCertificateAuthority(d Depot, name string) (*pkix.CertificateAuthority, error) {
+	crt, err := GetCertificate(d, name)
+	if err != nil {
+		return nil, fmt.Errorf("get CA %q certificate: %w", name, err)
+	}
+	key, err := GetPrivateKey(d, name)
+	if err != nil {
+		return nil, fmt.Errorf("get CA %q private key: %w", name, err)
+	}
+	return pkix.NewCertificateAuthority(name, crt, key)
+}
+
+// GetEncryptedCertificateAuthority retrieves an encrypted CA private key and
+// its certificate and verifies that they describe one signing identity.
+func GetEncryptedCertificateAuthority(d Depot, name string, passphrase []byte) (*pkix.CertificateAuthority, error) {
+	crt, err := GetCertificate(d, name)
+	if err != nil {
+		return nil, fmt.Errorf("get CA %q certificate: %w", name, err)
+	}
+	key, err := GetEncryptedPrivateKey(d, name, passphrase)
+	if err != nil {
+		return nil, fmt.Errorf("get encrypted CA %q private key: %w", name, err)
+	}
+	return pkix.NewCertificateAuthority(name, crt, key)
+}
+
 // DeleteCertificate removes a certificate file for a given name from the depot
 func DeleteCertificate(d Depot, name string) error {
 	return d.Delete(CrtTag(name))
@@ -140,13 +173,46 @@ func CheckPrivateKey(d Depot, name string) bool {
 	return d.Check(PrivKeyTag(name))
 }
 
-// GetPrivateKey retrieves a private key file for a given name from the depot
+// IsEncryptedPrivateKey reports whether the private key stored under name is
+// encrypted. Callers use this to distinguish a missing or malformed key from a
+// key that can be unlocked with a passphrase.
+func IsEncryptedPrivateKey(d Depot, name string) (bool, error) {
+	b, err := d.Get(PrivKeyTag(name))
+	if err != nil {
+		return false, err
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return false, nil
+	}
+	if block.Type == "ENCRYPTED PRIVATE KEY" {
+		return true, nil
+	}
+	for key, value := range block.Headers {
+		if strings.EqualFold(key, "Proc-Type") && strings.Contains(strings.ToUpper(value), "ENCRYPTED") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// GetPrivateKey retrieves a private key file for a given name from the depot.
+// When a certificate with the same name exists, the key must match its public
+// key; otherwise the load fails so a rotated key cannot be used with stale
+// certificate material.
 func GetPrivateKey(d Depot, name string) (key *pkix.Key, err error) {
 	b, err := d.Get(PrivKeyTag(name))
 	if err != nil {
 		return nil, err
 	}
-	return pkix.NewKeyFromPrivateKeyPEM(b)
+	key, err = pkix.NewKeyFromPrivateKeyPEM(b)
+	if err != nil {
+		return nil, fmt.Errorf("private key %q: %w", name, err)
+	}
+	if err := checkStoredCertificateIdentity(d, name, key); err != nil {
+		return nil, &StoredIdentityError{Err: err}
+	}
+	return key, nil
 }
 
 // PutEncryptedPrivateKey creates an encrypted private key file for a given name in the depot
@@ -158,13 +224,98 @@ func PutEncryptedPrivateKey(d Depot, name string, key *pkix.Key, passphrase []by
 	return d.Put(PrivKeyTag(name), b)
 }
 
-// GetEncryptedPrivateKey retrieves an encrypted private key file for a given name from the depot
+// GetEncryptedPrivateKey retrieves an encrypted private key file for a given
+// name from the depot and verifies it against a certificate with the same name
+// when one exists.
 func GetEncryptedPrivateKey(d Depot, name string, passphrase []byte) (key *pkix.Key, err error) {
 	b, err := d.Get(PrivKeyTag(name))
 	if err != nil {
 		return nil, err
 	}
-	return pkix.NewKeyFromEncryptedPrivateKeyPEM(b, passphrase)
+	key, err = pkix.NewKeyFromEncryptedPrivateKeyPEM(b, passphrase)
+	if err != nil {
+		return nil, fmt.Errorf("private key %q: %w", name, err)
+	}
+	if err := checkStoredCertificateIdentity(d, name, key); err != nil {
+		return nil, &StoredIdentityError{Err: err}
+	}
+	return key, nil
+}
+
+// StoredIdentityError reports that a key was parsed successfully but cannot be
+// used with the certificate stored under the same depot name.
+type StoredIdentityError struct {
+	Err error
+}
+
+func (e *StoredIdentityError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *StoredIdentityError) Unwrap() error {
+	return e.Err
+}
+
+// StoredIdentityMismatchError reports that a stored certificate and stored
+// private key share a name but do not contain the same public key.
+type StoredIdentityMismatchError struct {
+	Name                   string
+	CertificatePublicKeyID string
+	PrivateKeyID           string
+}
+
+func (e *StoredIdentityMismatchError) Error() string {
+	return fmt.Sprintf(
+		"certificate %q public key %s does not match private signer public key %s from the stored private key (stage: validate stored identity)",
+		e.Name, e.CertificatePublicKeyID, e.PrivateKeyID,
+	)
+}
+
+// checkStoredCertificateIdentity makes every key reader fail closed when the
+// depot already holds a certificate for the same name whose public key differs
+// from the private key. A missing certificate is allowed because request-cert
+// stores the key before any certificate exists.
+func checkStoredCertificateIdentity(d Depot, name string, key *pkix.Key) error {
+	if !CheckCertificate(d, name) {
+		return nil
+	}
+	crt, err := GetCertificate(d, name)
+	if err != nil {
+		return fmt.Errorf("read certificate %q for identity check: %w (stage: validate stored identity)", name, err)
+	}
+	rawCrt, err := crt.GetRawCertificate()
+	if err != nil {
+		return fmt.Errorf("parse certificate %q for identity check: %w (stage: validate stored identity)", name, err)
+	}
+
+	public := key.Public
+	if public == nil {
+		signer, ok := key.Private.(crypto.Signer)
+		if !ok {
+			return fmt.Errorf("private key %q does not implement crypto.Signer (stage: validate stored identity)", name)
+		}
+		public = signer.Public()
+	}
+	certificateID, err := pkix.PublicKeyFingerprint(rawCrt.PublicKey)
+	if err != nil {
+		return fmt.Errorf("fingerprint certificate %q public key: %w (stage: validate stored identity)", name, err)
+	}
+	privateID, err := pkix.PublicKeyFingerprint(public)
+	if err != nil {
+		return fmt.Errorf("fingerprint private key %q: %w (stage: validate stored identity)", name, err)
+	}
+	match, err := pkix.PublicKeysEqual(rawCrt.PublicKey, public)
+	if err != nil {
+		return fmt.Errorf("compare certificate %q and private key %q: %w (stage: validate stored identity)", name, name, err)
+	}
+	if !match {
+		return &StoredIdentityMismatchError{
+			Name:                   name,
+			CertificatePublicKeyID: certificateID,
+			PrivateKeyID:           privateID,
+		}
+	}
+	return nil
 }
 
 // PutCertificateRevocationList creates a CRL file for a given name and ca in the depot

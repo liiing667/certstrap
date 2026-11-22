@@ -114,12 +114,19 @@ func (c *revokeCommand) revocationList() (*x509.RevocationList, error) {
 func (c *revokeCommand) saveRevokedCertificates(ctx *cli.Context, cert *x509.Certificate, template *x509.RevocationList) error {
 	privateKey, err := depot.GetPrivateKey(d, c.ca)
 	if err != nil {
+		var identityErr *depot.StoredIdentityError
+		if errors.As(err, &identityErr) {
+			return fmt.Errorf("get CA key error when saving revoked certificates: %w", err)
+		}
 		pass, err := getPassPhrase(ctx, "CA key")
 		if err != nil {
 			return fmt.Errorf("error retreiving passphrase when saving revoked certificates: %v", err)
 		}
 		privateKey, err = depot.GetEncryptedPrivateKey(d, c.ca, pass)
 		if err != nil {
+			if errors.As(err, &identityErr) {
+				return fmt.Errorf("get CA key error when saving revoked certificates: %w", err)
+			}
 			return fmt.Errorf("get CA key error when saving revoked certificates: %v", err)
 		}
 	}
