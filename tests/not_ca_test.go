@@ -21,6 +21,7 @@ package tests
 
 import (
 	"os"
+	"path"
 	"strings"
 	"testing"
 )
@@ -63,7 +64,11 @@ func TestNotCA(t *testing.T) {
 	}
 
 	stdout, stderr, err = run(binPath, "sign", "--passphrase", passphrase, "--CA", "cert2", "cert3")
-	if stderr != "Selected CA certificate is not allowed to sign certificates.\n" {
-		t.Fatalf("Failed to receive expected error.")
+	if err == nil || !strings.Contains(stderr, "Selected CA certificate is not allowed to sign certificates.") {
+		t.Fatalf("Failed to receive expected error, got stderr: %q", stderr)
+	}
+	// The rejected signing must not have published a certificate.
+	if _, statErr := os.Stat(path.Join(depotDir, "cert3.crt")); !os.IsNotExist(statErr) {
+		t.Fatalf("certificate must not be published for a non-CA issuer: %v", statErr)
 	}
 }

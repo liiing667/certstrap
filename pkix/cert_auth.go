@@ -90,6 +90,17 @@ func CreateIntermediateCertificateAuthority(crtAuth *Certificate, keyAuth *Key, 
 func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest, proposedExpiry time.Time, opts ...Option) (*Certificate, error) {
 	authTemplate := newAuthTemplate()
 
+	rawCrtAuth, err := crtAuth.GetRawCertificate()
+	if err != nil {
+		return nil, err
+	}
+	// Gate the whole transaction on the issuer's authorization before any
+	// certificate material is produced. This makes non-CA issuers, missing
+	// keyCertSign usage and exhausted path length constraints fail closed.
+	if err := CheckIssuerAuthorization(rawCrtAuth, true); err != nil {
+		return nil, err
+	}
+
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
 	if err != nil {
@@ -121,11 +132,6 @@ func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, key
 	authTemplate.DNSNames = rawCsr.DNSNames
 	authTemplate.URIs = rawCsr.URIs
 
-	rawCrtAuth, err := crtAuth.GetRawCertificate()
-	if err != nil {
-		return nil, err
-	}
-
 	applyOptions(&authTemplate, opts)
 
 	crtOutBytes, err := x509.CreateCertificate(rand.Reader, &authTemplate, rawCrtAuth, rawCsr.PublicKey, keyAuth.Private)
@@ -133,17 +139,34 @@ func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, key
 		return nil, err
 	}
 
-	return NewCertificateFromDER(crtOutBytes), nil
+	crtOut := NewCertificateFromDER(crtOutBytes)
+
+	// Re-verify the freshly issued certificate against the issuer before
+	// returning it, using the exact checks a chain consumer performs. This
+	// catches any defect the template-level gate could not observe and keeps
+	// issuance and verification on a single source of truth.
+	if err := checkIssuedBy(crtOut, rawCrtAuth); err != nil {
+		return nil, err
+	}
+
+	return crtOut, nil
 }
 
 // WithPathlenOption will check if the certificate should have `pathlen` or not.
 func WithPathlenOption(pathlen int, excludePathlen bool) func(template *x509.Certificate) {
 	return func(template *x509.Certificate) {
-		template.MaxPathLen = pathlen
-
 		if excludePathlen {
+			// -1 omits pathLenConstraint from the basic constraints extension.
 			template.MaxPathLen = -1
+			template.MaxPathLenZero = false
+			return
 		}
+
+		template.MaxPathLen = pathlen
+		// Without MaxPathLenZero, crypto/x509 treats MaxPathLen==0 as "the
+		// constraint is absent", silently producing an unlimited CA. Assert the
+		// flag so an explicit path length of zero is actually encoded.
+		template.MaxPathLenZero = pathlen == 0
 	}
 }
 

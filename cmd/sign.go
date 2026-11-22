@@ -114,17 +114,19 @@ func newSignAction(c *cli.Context) {
 		fmt.Fprintln(os.Stderr, "Get CA certificate error:", err)
 		os.Exit(1)
 	}
-	// Validate that crt is allowed to sign certificates.
-	raw_crt, err := crt.GetRawCertificate()
+	// Validate that the selected issuer is authorized to sign certificates.
+	// This single gate covers the cA boolean, keyCertSign key usage and the
+	// path length constraint (for intermediate issuance); it is shared by the
+	// pkix signing functions and re-checked after the certificate is created.
+	rawCrt, err := crt.GetRawCertificate()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "GetRawCertificate failed on CA certificate:", err)
 		os.Exit(1)
 	}
-	// We punt on checking BasicConstraintsValid and checking MaxPathLen. The goal
-	// is to prevent accidentally creating invalid certificates, not protecting
-	// against malicious input.
-	if !raw_crt.IsCA {
+	childIsCA := c.Bool("intermediate")
+	if err = pkix.CheckIssuerAuthorization(rawCrt, childIsCA); err != nil {
 		fmt.Fprintln(os.Stderr, "Selected CA certificate is not allowed to sign certificates.")
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
@@ -143,7 +145,7 @@ func newSignAction(c *cli.Context) {
 	}
 
 	var crtOut *pkix.Certificate
-	if c.Bool("intermediate") {
+	if childIsCA {
 		fmt.Fprintln(os.Stderr, "Building intermediate")
 
 		opts := []pkix.Option{
@@ -163,8 +165,15 @@ func newSignAction(c *cli.Context) {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Create certificate error:", err)
 		os.Exit(1)
-	} else {
-		fmt.Printf("Created %s/%s.crt from %s/%s.csr signed by %s/%s.key\n", depotDir, formattedReqName, depotDir, formattedReqName, depotDir, formattedCAName)
+	}
+
+	// Final chain-consumer verification. The certificate is verified exactly
+	// like a TLS client would verify it, using the issuer chain reconstructed
+	// from the depot. Only after this succeeds are any bytes published, so a
+	// failed or retried invocation can never leave a certificate behind.
+	if err = verifyIssuedCertificate(formattedCAName, crtOut); err != nil {
+		fmt.Fprintln(os.Stderr, "Refusing to publish certificate, chain verification failed:", err)
+		os.Exit(1)
 	}
 
 	if c.Bool("stdout") {
@@ -179,5 +188,8 @@ func newSignAction(c *cli.Context) {
 
 	if err = putCertificate(c, d, formattedReqName, crtOut); err != nil {
 		fmt.Fprintln(os.Stderr, "Save certificate error:", err)
+		os.Exit(1)
 	}
+
+	fmt.Printf("Created %s/%s.crt from %s/%s.csr signed by %s/%s.key\n", depotDir, formattedReqName, depotDir, formattedReqName, depotDir, formattedCAName)
 }

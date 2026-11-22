@@ -99,11 +99,25 @@ func CreateCertificateHost(crtAuth *Certificate, keyAuth *Key, csr *CertificateS
 	if err != nil {
 		return nil, err
 	}
+	// A leaf certificate may only be minted by an authorized CA. Sharing this
+	// gate with intermediate issuance keeps one authorization rule set for the
+	// whole PKI and makes non-CA or key-usage-invalid issuers fail closed.
+	if err := CheckIssuerAuthorization(rawCrtAuth, false); err != nil {
+		return nil, err
+	}
 
 	crtHostBytes, err := x509.CreateCertificate(rand.Reader, &hostTemplate, rawCrtAuth, rawCsr.PublicKey, keyAuth.Private)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewCertificateFromDER(crtHostBytes), nil
+	crtOut := NewCertificateFromDER(crtHostBytes)
+
+	// Verify the new leaf against its issuer before handing it back, so the
+	// published output is exactly what a chain consumer will accept.
+	if err := checkIssuedBy(crtOut, rawCrtAuth); err != nil {
+		return nil, err
+	}
+
+	return crtOut, nil
 }
