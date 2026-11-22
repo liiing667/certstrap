@@ -71,6 +71,11 @@ func (d *FileDepot) path(name string) string {
 	return filepath.Join(d.dirPath, name)
 }
 
+// Dir returns the absolute path of the directory backing the depot.
+func (d *FileDepot) Dir() string {
+	return d.dirPath
+}
+
 // Put inserts the data into the file specified by the tag
 func (d *FileDepot) Put(tag *Tag, data []byte) error {
 	if data == nil {

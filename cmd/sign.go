@@ -56,6 +56,10 @@ func NewSignCommand() cli.Command {
 				Usage: "Path to certificate request PEM file (if blank, will use --depot-path and default name)",
 			},
 			cli.StringFlag{
+				Name:  "key",
+				Usage: "Path to request private key PEM file (if blank, will use the request generation or --depot-path and default name)",
+			},
+			cli.StringFlag{
 				Name:  "cert",
 				Usage: "Path to certificate output PEM file (if blank, will use --depot-path and default name)",
 			},
@@ -107,6 +111,10 @@ func newSignAction(c *cli.Context) {
 	csr, err := getCertificateSigningRequest(c, d, formattedReqName)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Get certificate request error:", err)
+		os.Exit(1)
+	}
+	if err := validateRequestGeneration(c, csr, formattedReqName); err != nil {
+		fmt.Fprintln(os.Stderr, "Verify certificate request error:", err)
 		os.Exit(1)
 	}
 	crt, err := depot.GetCertificate(d, formattedCAName)
@@ -164,7 +172,8 @@ func newSignAction(c *cli.Context) {
 		fmt.Fprintln(os.Stderr, "Create certificate error:", err)
 		os.Exit(1)
 	} else {
-		fmt.Printf("Created %s/%s.crt from %s/%s.csr signed by %s/%s.key\n", depotDir, formattedReqName, depotDir, formattedReqName, depotDir, formattedCAName)
+		requestDir := requestDepotDir()
+		fmt.Printf("Created %s/%s.crt from %s/%s.csr signed by %s/%s.key\n", requestDir, formattedReqName, requestDir, formattedReqName, requestDir, formattedCAName)
 	}
 
 	if c.Bool("stdout") {
@@ -179,5 +188,6 @@ func newSignAction(c *cli.Context) {
 
 	if err = putCertificate(c, d, formattedReqName, crtOut); err != nil {
 		fmt.Fprintln(os.Stderr, "Save certificate error:", err)
+		os.Exit(1)
 	}
 }

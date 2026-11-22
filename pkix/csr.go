@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -79,6 +80,14 @@ func ParseAndValidateURIs(uriList string) (res []*url.URL, err error) {
 
 // CreateCertificateSigningRequest sets up a request to create a csr file with the given parameters
 func CreateCertificateSigningRequest(key *Key, organizationalUnit string, ipList []net.IP, domainList []string, uriList []*url.URL, organization string, country string, province string, locality string, commonName string) (*CertificateSigningRequest, error) {
+	return CreateCertificateSigningRequestWithExtensions(key, organizationalUnit, ipList, domainList, uriList, organization, country, province, locality, commonName, nil)
+}
+
+// CreateCertificateSigningRequestWithExtensions sets up a request to create a
+// csr file with the given parameters and additional, non-critical extensions.
+// The extensions are part of the signed request, so they cannot be changed
+// without invalidating the request signature.
+func CreateCertificateSigningRequestWithExtensions(key *Key, organizationalUnit string, ipList []net.IP, domainList []string, uriList []*url.URL, organization string, country string, province string, locality string, commonName string, extraExtensions []pkix.Extension) (*CertificateSigningRequest, error) {
 	csrPkixName := pkix.Name{CommonName: commonName}
 
 	if len(organizationalUnit) > 0 {
@@ -97,10 +106,11 @@ func CreateCertificateSigningRequest(key *Key, organizationalUnit string, ipList
 		csrPkixName.Locality = []string{locality}
 	}
 	csrTemplate := &x509.CertificateRequest{
-		Subject:     csrPkixName,
-		IPAddresses: ipList,
-		DNSNames:    domainList,
-		URIs:        uriList,
+		Subject:         csrPkixName,
+		IPAddresses:     ipList,
+		DNSNames:        domainList,
+		URIs:            uriList,
+		ExtraExtensions: extraExtensions,
 	}
 
 	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, csrTemplate, key.Private)
@@ -170,6 +180,17 @@ func (c *CertificateSigningRequest) CheckSignature() error {
 // checkSignature verifies a signature made by the key on a CSR, such
 // as on the CSR itself.
 func checkSignature(csr *x509.CertificateRequest, algo x509.SignatureAlgorithm, signed, signature []byte) error {
+	if algo == x509.PureEd25519 {
+		pub, ok := csr.PublicKey.(ed25519.PublicKey)
+		if !ok {
+			return x509.ErrUnsupportedAlgorithm
+		}
+		if !ed25519.Verify(pub, signed, signature) {
+			return errors.New("x509: Ed25519 verification failure")
+		}
+		return nil
+	}
+
 	var hashType crypto.Hash
 	switch algo {
 	case x509.SHA1WithRSA, x509.ECDSAWithSHA1:

@@ -18,8 +18,10 @@
 package cmd
 
 import (
+	x509pkix "crypto/x509/pkix"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -139,9 +141,26 @@ func newCertAction(c *cli.Context) {
 	}
 
 	var formattedName = formatName(name)
+	explicitCSR := c.IsSet("csr")
+	explicitKey := c.IsSet("key")
+	csrDisplayPath := fileName(c, "csr", requestDepotDir(), formattedName, "csr")
+	keyDisplayPath := fileName(c, "key", requestDepotDir(), formattedName, "key")
+	csrFilepath := csrDisplayPath
+	keyFilepath := keyDisplayPath
+	if !explicitCSR {
+		csrFilepath = filepath.Join(requestDepotPhysicalDir(), formattedName+".csr")
+	}
+	if !explicitKey {
+		keyFilepath = filepath.Join(requestDepotPhysicalDir(), formattedName+".key")
+	}
+
+	if sameRequestTargetPath(keyFilepath, csrFilepath) {
+		fmt.Fprintln(os.Stderr, "Private key and certificate request paths must be different.")
+		os.Exit(1)
+	}
 
 	// skip the check if the --csr option is specified
-	if !c.IsSet("csr") && (depot.CheckCertificateSigningRequest(d, formattedName) || depot.CheckPrivateKey(d, formattedName)) {
+	if !explicitCSR && (depot.CheckCertificateSigningRequest(d, formattedName) || depot.CheckPrivateKey(d, formattedName)) {
 		fmt.Fprintf(os.Stderr, "Certificate request \"%s\" already exists!\n", formattedName)
 		os.Exit(1)
 	}
@@ -157,78 +176,150 @@ func newCertAction(c *cli.Context) {
 		}
 	}
 
-	// generate new key if one doesn't exist already
+	// Generate a new key if one doesn't exist already. The key bytes that are
+	// about to be published are kept in memory so that the CSR, the key file
+	// and the generation metadata can only describe this one key pair.
 	var key *pkix.Key
-	keyFilepath := fileName(c, "key", depotDir, formattedName, "key")
+	var keyBytes []byte
+	var writeKey bool
+	var keyEncrypted bool
 	switch {
-	case c.IsSet("key") && fileExists(c.String("key")):
-		keyBytes, err := os.ReadFile(c.String("key"))
+	case explicitKey && fileExists(keyFilepath):
+		keyBytes, err = os.ReadFile(keyFilepath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Read Key error:", err)
 			os.Exit(1)
 		}
 
 		key, err = pkix.NewKeyFromPrivateKeyPEM(keyBytes)
+		if err != nil && len(passphrase) > 0 {
+			key, err = pkix.NewKeyFromEncryptedPrivateKeyPEM(keyBytes, passphrase)
+			keyEncrypted = err == nil
+		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Read Key error:", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Read %s\n", keyFilepath)
 	case c.IsSet("curve"):
 		curve := c.String("curve")
 		key, err = createKeyOnCurve(curve)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Create %s Key error: %v", curve, err)
+			fmt.Fprintf(os.Stderr, "Create %s Key error: %v\n", curve, err)
 			os.Exit(1)
 		}
-		if len(passphrase) > 0 {
-			fmt.Printf("Created %s (encrypted by passphrase)\n", keyFilepath)
-		} else {
-			fmt.Printf("Created %s\n", keyFilepath)
-		}
+		writeKey = true
 	default:
 		key, err = pkix.CreateRSAKey(c.Int("key-bits"))
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Create RSA Key error:", err)
 			os.Exit(1)
 		}
-		if len(passphrase) > 0 {
-			fmt.Printf("Created %s (encrypted by passphrase)\n", keyFilepath)
+		writeKey = true
+	}
+
+	if writeKey {
+		keyEncrypted = len(passphrase) > 0
+		if keyEncrypted {
+			keyBytes, err = key.ExportEncryptedPrivate(passphrase)
 		} else {
-			fmt.Printf("Created %s\n", keyFilepath)
+			keyBytes, err = key.ExportPrivate()
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Save private key error:", err)
+			os.Exit(1)
 		}
 	}
 
-	csr, err := pkix.CreateCertificateSigningRequest(key, c.String("organizational-unit"), ips, domains, uris, c.String("organization"), c.String("country"), c.String("province"), c.String("locality"), name)
+	// Validate both destinations before anything is written. The key is never
+	// written over an existing file; an existing CSR is only replaced when the
+	// caller explicitly selected its path with --csr.
+	if writeKey {
+		if err := prepareRequestTargetFile(keyFilepath, false, !explicitKey); err != nil {
+			fmt.Fprintln(os.Stderr, "Save private key error:", err)
+			os.Exit(1)
+		}
+	}
+	if err := prepareRequestTargetFile(csrFilepath, explicitCSR, !explicitCSR); err != nil {
+		fmt.Fprintln(os.Stderr, "Save certificate request error:", err)
+		os.Exit(1)
+	}
+
+	generationKeyPath := ""
+	if explicitKey {
+		generationKeyPath, err = filepath.Abs(keyFilepath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Create certificate request error:", err)
+			os.Exit(1)
+		}
+	}
+	_, generationExtension, err := newRequestGeneration(key, generationKeyPath, keyBytes)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Create certificate request error:", err)
 		os.Exit(1)
-	} else {
-		fmt.Printf("Created %s\n", fileName(c, "csr", depotDir, formattedName, "csr"))
 	}
+
+	csr, err := pkix.CreateCertificateSigningRequestWithExtensions(key, c.String("organizational-unit"), ips, domains, uris, c.String("organization"), c.String("country"), c.String("province"), c.String("locality"), name, []x509pkix.Extension{generationExtension})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Create certificate request error:", err)
+		os.Exit(1)
+	}
+
+	csrBytes, err := csr.Export()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Create certificate request error:", err)
+		os.Exit(1)
+	}
+
+	if err := commitRequestFiles(writeKey, keyFilepath, keyBytes, csrFilepath, csrBytes); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	if !writeKey {
+		fmt.Printf("Read %s\n", keyDisplayPath)
+	} else if keyEncrypted {
+		fmt.Printf("Created %s (encrypted by passphrase)\n", keyDisplayPath)
+	} else {
+		fmt.Printf("Created %s\n", keyDisplayPath)
+	}
+	fmt.Printf("Created %s\n", csrDisplayPath)
 
 	if c.Bool("stdout") {
-		csrBytes, err := csr.Export()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Print certificate request error:", err)
-			os.Exit(1)
-		} else {
-			fmt.Println(string(csrBytes))
+		fmt.Println(string(csrBytes))
+	}
+}
+
+func prepareRequestTargetFile(path string, allowOverwrite, createParent bool) error {
+	info, err := os.Stat(path)
+	switch {
+	case err == nil:
+		if info.IsDir() {
+			return fmt.Errorf("%s is a directory", path)
 		}
+		if !allowOverwrite {
+			return fmt.Errorf("%s already exists", path)
+		}
+		return nil
+	case !os.IsNotExist(err):
+		return err
 	}
 
-	if err = putCertificateSigningRequest(c, d, formattedName, csr); err != nil {
-		fmt.Fprintln(os.Stderr, "Save certificate request error:", err)
+	if createParent {
+		return os.MkdirAll(filepath.Dir(path), 0755)
 	}
-	if len(passphrase) > 0 {
-		if err = putEncryptedPrivateKey(c, d, formattedName, key, passphrase); err != nil {
-			fmt.Fprintln(os.Stderr, "Save encrypted private key error:", err)
-		}
-	} else {
-		if err = putPrivateKey(c, d, formattedName, key); err != nil {
-			fmt.Fprintln(os.Stderr, "Save private key error:", err)
-		}
+	return nil
+}
+
+func sameRequestTargetPath(first, second string) bool {
+	firstPath, err := filepath.Abs(first)
+	if err != nil {
+		return first == second
 	}
+	secondPath, err := filepath.Abs(second)
+	if err != nil {
+		return first == second
+	}
+	return filepath.Clean(firstPath) == filepath.Clean(secondPath)
 }
 
 func formatName(name string) string {

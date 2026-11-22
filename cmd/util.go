@@ -46,6 +46,23 @@ func InitDepot(path string) error {
 	return nil
 }
 
+func requestDepotDir() string {
+	if depotDir != "" {
+		return depotDir
+	}
+	if d != nil {
+		return d.Dir()
+	}
+	return "."
+}
+
+func requestDepotPhysicalDir() string {
+	if d != nil {
+		return d.Dir()
+	}
+	return requestDepotDir()
+}
+
 func createPassPhrase() ([]byte, error) {
 	pass1, err := gopass.GetPasswdPrompt("Enter passphrase (empty for no passphrase): ", false, os.Stdin, os.Stdout)
 	if err != nil {
@@ -88,17 +105,6 @@ func putCertificate(c *cli.Context, d *depot.FileDepot, name string, crt *pkix.C
 	return depot.PutCertificate(d, name, crt)
 }
 
-func putCertificateSigningRequest(c *cli.Context, d *depot.FileDepot, name string, csr *pkix.CertificateSigningRequest) error {
-	if c.IsSet("csr") {
-		bytes, err := csr.Export()
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(c.String("csr"), bytes, depot.LeafPerm)
-	}
-	return depot.PutCertificateSigningRequest(d, name, csr)
-}
-
 func getCertificateSigningRequest(c *cli.Context, d *depot.FileDepot, name string) (*pkix.CertificateSigningRequest, error) {
 	if c.IsSet("csr") {
 		bytes, err := os.ReadFile(c.String("csr"))
@@ -108,36 +114,6 @@ func getCertificateSigningRequest(c *cli.Context, d *depot.FileDepot, name strin
 		return pkix.NewCertificateSigningRequestFromPEM(bytes)
 	}
 	return depot.GetCertificateSigningRequest(d, name)
-}
-
-func putEncryptedPrivateKey(c *cli.Context, d *depot.FileDepot, name string, key *pkix.Key, passphrase []byte) error {
-	if c.IsSet("key") {
-		if fileExists(c.String("key")) {
-			return nil
-		}
-
-		bytes, err := key.ExportEncryptedPrivate(passphrase)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(c.String("key"), bytes, depot.BranchPerm)
-	}
-	return depot.PutEncryptedPrivateKey(d, name, key, passphrase)
-}
-
-func putPrivateKey(c *cli.Context, d *depot.FileDepot, name string, key *pkix.Key) error {
-	if c.IsSet("key") {
-		if fileExists(c.String("key")) {
-			return nil
-		}
-
-		bytes, err := key.ExportPrivate()
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(c.String("key"), bytes, depot.BranchPerm)
-	}
-	return depot.PutPrivateKey(d, name, key)
 }
 
 func fileExists(filepath string) bool {
