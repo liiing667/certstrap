@@ -23,13 +23,12 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"math/big"
 	"net"
 	"net/url"
 	"strings"
@@ -110,17 +109,18 @@ func CreateCertificateSigningRequest(key *Key, organizationalUnit string, ipList
 	return NewCertificateSigningRequestFromDER(csrBytes), nil
 }
 
-// CertificateSigningRequest is a wrapper around a x509 CertificateRequest and its DER-formatted bytes
+// CertificateSigningRequest is a wrapper around a x509 CertificateRequest and
+// the exact DER bytes it was parsed from. The DER bytes are the immutable
+// source of truth for the request: every parse returns a fresh object, so a
+// parsed request can never keep stale state from an earlier operation.
 type CertificateSigningRequest struct {
 	// derBytes is always set for valid Certificate
 	derBytes []byte
-
-	cr *x509.CertificateRequest
 }
 
 // NewCertificateSigningRequestFromDER inits CertificateSigningRequest from DER-format bytes
 func NewCertificateSigningRequestFromDER(derBytes []byte) *CertificateSigningRequest {
-	return &CertificateSigningRequest{derBytes: derBytes}
+	return &CertificateSigningRequest{derBytes: append([]byte(nil), derBytes...)}
 }
 
 // NewCertificateSigningRequestFromPEM inits CertificateSigningRequest from PEM-format bytes
@@ -133,81 +133,155 @@ func NewCertificateSigningRequestFromPEM(data []byte) (*CertificateSigningReques
 	if (pemBlock.Type != csrPEMBlockType && pemBlock.Type != oldCsrPEMBlockType) || len(pemBlock.Headers) != 0 {
 		return nil, errors.New("unmatched type or headers")
 	}
-	return &CertificateSigningRequest{derBytes: pemBlock.Bytes}, nil
+	return &CertificateSigningRequest{derBytes: append([]byte(nil), pemBlock.Bytes...)}, nil
 }
 
-// build cr field if needed
-func (c *CertificateSigningRequest) buildPKCS10CertificateSigningRequest() error {
-	if c.cr != nil {
-		return nil
+// parseRaw parses the request's immutable DER bytes. It deliberately does not
+// cache the result: callers must not be able to observe a request, cache it,
+// replace the request bytes, and then have the old parse reused.
+func (c *CertificateSigningRequest) parseRaw() (*x509.CertificateRequest, error) {
+	if c == nil || len(c.derBytes) == 0 {
+		return nil, errors.New("empty certificate signing request")
 	}
-
-	var err error
-	c.cr, err = x509.ParseCertificateRequest(c.derBytes)
-	if err != nil {
-		return err
-	}
-	return nil
+	derBytes := append([]byte(nil), c.derBytes...)
+	return x509.ParseCertificateRequest(derBytes)
 }
 
 // GetRawCertificateSigningRequest returns a copy of this certificate request as an x509.CertificateRequest.
 func (c *CertificateSigningRequest) GetRawCertificateSigningRequest() (*x509.CertificateRequest, error) {
-	if err := c.buildPKCS10CertificateSigningRequest(); err != nil {
-		return nil, err
-	}
-	return c.cr, nil
+	return c.parseRaw()
 }
 
 // CheckSignature verifies that the signature is a valid signature
 // using the public key in CertificateSigningRequest.
 func (c *CertificateSigningRequest) CheckSignature() error {
-	if err := c.buildPKCS10CertificateSigningRequest(); err != nil {
+	cr, err := c.parseRaw()
+	if err != nil {
 		return err
 	}
-	return checkSignature(c.cr, c.cr.SignatureAlgorithm, c.cr.RawTBSCertificateRequest, c.cr.Signature)
+	if err := checkSignature(cr, cr.SignatureAlgorithm, cr.RawTBSCertificateRequest, cr.Signature); err != nil {
+		return fmt.Errorf("certificate request signature verification failed: %w", err)
+	}
+	return nil
 }
 
 // checkSignature verifies a signature made by the key on a CSR, such
 // as on the CSR itself.
 func checkSignature(csr *x509.CertificateRequest, algo x509.SignatureAlgorithm, signed, signature []byte) error {
-	var hashType crypto.Hash
+	if csr == nil {
+		return errors.New("nil certificate request")
+	}
+	verified := *csr
+	verified.SignatureAlgorithm = algo
+	verified.RawTBSCertificateRequest = signed
+	verified.Signature = signature
+	err := verified.CheckSignature()
+	if err == nil {
+		return nil
+	}
+	if algo != x509.SHA1WithRSA && algo != x509.ECDSAWithSHA1 {
+		return err
+	}
+
+	// Older certstrap releases accepted SHA-1 CSRs. Keep that compatibility
+	// even if the standard library's verification policy rejects SHA-1.
+	digest := sha1.Sum(signed)
 	switch algo {
-	case x509.SHA1WithRSA, x509.ECDSAWithSHA1:
-		hashType = crypto.SHA1
-	case x509.SHA256WithRSA, x509.ECDSAWithSHA256:
-		hashType = crypto.SHA256
-	case x509.SHA384WithRSA, x509.ECDSAWithSHA384:
-		hashType = crypto.SHA384
-	case x509.SHA512WithRSA, x509.ECDSAWithSHA512:
-		hashType = crypto.SHA512
+	case x509.SHA1WithRSA:
+		pub, ok := csr.PublicKey.(*rsa.PublicKey)
+		if !ok {
+			return x509.ErrUnsupportedAlgorithm
+		}
+		return rsa.VerifyPKCS1v15(pub, crypto.SHA1, digest[:], signature)
+	case x509.ECDSAWithSHA1:
+		pub, ok := csr.PublicKey.(*ecdsa.PublicKey)
+		if !ok {
+			return x509.ErrUnsupportedAlgorithm
+		}
+		if !ecdsa.VerifyASN1(pub, digest[:], signature) {
+			return errors.New("x509: ECDSA signature verification failure")
+		}
+		return nil
 	default:
 		return x509.ErrUnsupportedAlgorithm
 	}
-	if !hashType.Available() {
-		return x509.ErrUnsupportedAlgorithm
-	}
-	h := hashType.New()
+}
 
-	// nolint:errcheck
-	h.Write(signed)
-	digest := h.Sum(nil)
-	switch pub := csr.PublicKey.(type) {
-	case *rsa.PublicKey:
-		return rsa.VerifyPKCS1v15(pub, hashType, digest, signature)
-	case *ecdsa.PublicKey:
-		ecdsaSig := new(struct{ R, S *big.Int })
-		if _, err := asn1.Unmarshal(signature, ecdsaSig); err != nil {
-			return err
-		}
-		if ecdsaSig.R.Sign() <= 0 || ecdsaSig.S.Sign() <= 0 {
-			return errors.New("x509: ECDSA signature contained zero or negative values")
-		}
-		if !ecdsa.Verify(pub, digest, ecdsaSig.R, ecdsaSig.S) {
-			return errors.New("x509: ECDSA verification failure")
-		}
+// verifiedCertificateRequest is the immutable result of parsing and verifying
+// exactly one CSR. All certificate issuance inputs are copied out of that one
+// parse, so proof of possession, public key, subject, SANs and subject key ID
+// can never come from different requests or from a later mutation.
+type verifiedCertificateRequest struct {
+	publicKey      crypto.PublicKey
+	rawSubject     []byte
+	subjectKeyID   []byte
+	dnsNames       []string
+	emailAddresses []string
+	ipAddresses    []net.IP
+	uris           []*url.URL
+}
+
+// verifiedForIssuance parses and verifies one CSR, then snapshots every value
+// that may be used by certificate issuance.
+func (c *CertificateSigningRequest) verifiedForIssuance() (*verifiedCertificateRequest, error) {
+	raw, err := c.parseRaw()
+	if err != nil {
+		return nil, err
+	}
+	if err := checkSignature(raw, raw.SignatureAlgorithm, raw.RawTBSCertificateRequest, raw.Signature); err != nil {
+		return nil, fmt.Errorf("certificate request signature verification failed: %w", err)
+	}
+	if raw.PublicKey == nil || len(raw.RawSubjectPublicKeyInfo) == 0 {
+		return nil, errors.New("certificate request does not contain a public key")
+	}
+
+	subjectKeyID, err := GenerateSubjectKeyID(raw.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("certificate request public key: %w", err)
+	}
+
+	return &verifiedCertificateRequest{
+		publicKey:      raw.PublicKey,
+		rawSubject:     append([]byte(nil), raw.RawSubject...),
+		subjectKeyID:   subjectKeyID,
+		dnsNames:       cloneStrings(raw.DNSNames),
+		emailAddresses: cloneStrings(raw.EmailAddresses),
+		ipAddresses:    cloneIPs(raw.IPAddresses),
+		uris:           cloneURLs(raw.URIs),
+	}, nil
+}
+
+func cloneStrings(values []string) []string {
+	if len(values) == 0 {
 		return nil
 	}
-	return x509.ErrUnsupportedAlgorithm
+	return append([]string(nil), values...)
+}
+
+func cloneIPs(values []net.IP) []net.IP {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]net.IP, len(values))
+	for i, value := range values {
+		cloned[i] = append(net.IP(nil), value...)
+	}
+	return cloned
+}
+
+func cloneURLs(values []*url.URL) []*url.URL {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]*url.URL, len(values))
+	for i, value := range values {
+		if value == nil {
+			continue
+		}
+		copied := *value
+		cloned[i] = &copied
+	}
+	return cloned
 }
 
 // Export returns PEM-format bytes

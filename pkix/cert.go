@@ -40,7 +40,7 @@ type Certificate struct {
 
 // NewCertificateFromDER inits Certificate from DER-format bytes
 func NewCertificateFromDER(derBytes []byte) *Certificate {
-	return &Certificate{derBytes: derBytes}
+	return &Certificate{derBytes: append([]byte(nil), derBytes...)}
 }
 
 // NewCertificateFromPEM inits Certificate from PEM-format bytes
@@ -55,7 +55,7 @@ func NewCertificateFromPEM(data []byte) (c *Certificate, err error) {
 		err = errors.New("unmatched type or headers")
 		return
 	}
-	c = &Certificate{derBytes: pemBlock.Bytes}
+	c = &Certificate{derBytes: append([]byte(nil), pemBlock.Bytes...)}
 	return
 }
 
@@ -65,7 +65,7 @@ func (c *Certificate) buildX509Certificate() error {
 		return nil
 	}
 
-	crts, err := x509.ParseCertificates(c.derBytes)
+	crts, err := x509.ParseCertificates(append([]byte(nil), c.derBytes...))
 	if err != nil {
 		return err
 	}
@@ -82,6 +82,27 @@ func (c *Certificate) GetRawCertificate() (*x509.Certificate, error) {
 		return nil, err
 	}
 	return c.crt, nil
+}
+
+// rawSnapshot parses the certificate's immutable DER bytes into a fresh
+// certificate. Issuance uses this instead of the cached GetRawCertificate
+// result so that CA authorization, the signing template and final certificate
+// verification all describe the same certificate snapshot.
+func (c *Certificate) rawSnapshot() (*x509.Certificate, error) {
+	if c == nil {
+		return nil, errors.New("nil certificate")
+	}
+	if len(c.derBytes) == 0 {
+		return c.GetRawCertificate()
+	}
+	crts, err := x509.ParseCertificates(append([]byte(nil), c.derBytes...))
+	if err != nil {
+		return nil, err
+	}
+	if len(crts) != 1 {
+		return nil, errors.New("unsupported multiple certificates in a block")
+	}
+	return crts[0], nil
 }
 
 // GetExpirationDuration gets time duration before expiration

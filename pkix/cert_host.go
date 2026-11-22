@@ -20,7 +20,6 @@ package pkix
 import (
 	"crypto/rand"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"math/big"
 	"time"
 )
@@ -28,12 +27,19 @@ import (
 // CreateCertificateHost creates certificate for host.
 // The arguments include CA certificate, CA key, certificate request.
 func CreateCertificateHost(crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest, proposedExpiry time.Time) (*Certificate, error) {
+	request, err := certificateRequestForIssuance(csr)
+	if err != nil {
+		return nil, err
+	}
+	rawCrtAuth, signer, err := authorizeCA(crtAuth, keyAuth)
+	if err != nil {
+		return nil, err
+	}
+
 	// Build CA based on RFC5280
 	hostTemplate := x509.Certificate{
 		// **SHOULD** be filled in a unique number
 		SerialNumber: big.NewInt(0),
-		// **SHOULD** be filled in host info
-		Subject: pkix.Name{},
 		// NotBefore is set to be 10min earlier to fix gap on time difference in cluster
 		NotBefore: time.Now().Add(-10*time.Minute).UTC(),
 		// 10-year lease
@@ -66,44 +72,25 @@ func CreateCertificateHost(crtAuth *Certificate, keyAuth *Key, csr *CertificateS
 	if err != nil {
 		return nil, err
 	}
-	hostTemplate.SerialNumber.Set(serialNumber)
-
-	rawCsr, err := csr.GetRawCertificateSigningRequest()
-	if err != nil {
-		return nil, err
-	}
+	hostTemplate.SerialNumber = serialNumber
 
 	// pkix.Name{} doesn't take ordering into account.
 	// RawSubject works because CreateCertificate() first checks if
 	// RawSubject has a value.
-	hostTemplate.RawSubject = rawCsr.RawSubject
+	hostTemplate.RawSubject = append([]byte(nil), request.rawSubject...)
+	// Ensure the certificate does not expire after its issuer.
+	hostTemplate.NotAfter = certificateNotAfter(rawCrtAuth, proposedExpiry)
+	hostTemplate.SubjectKeyId = append([]byte(nil), request.subjectKeyID...)
+	hostTemplate.AuthorityKeyId = append([]byte(nil), rawCrtAuth.SubjectKeyId...)
+	hostTemplate.IPAddresses = cloneIPs(request.ipAddresses)
+	hostTemplate.DNSNames = cloneStrings(request.dnsNames)
+	hostTemplate.EmailAddresses = cloneStrings(request.emailAddresses)
+	hostTemplate.URIs = cloneURLs(request.uris)
 
-	caExpiry := time.Now().Add(crtAuth.GetExpirationDuration())
-	// ensure cert doesn't expire after issuer
-	if caExpiry.Before(proposedExpiry) {
-		hostTemplate.NotAfter = caExpiry
-	} else {
-		hostTemplate.NotAfter = proposedExpiry
-	}
-
-	hostTemplate.SubjectKeyId, err = GenerateSubjectKeyID(rawCsr.PublicKey)
+	crtHostBytes, err := x509.CreateCertificate(rand.Reader, &hostTemplate, rawCrtAuth, request.publicKey, signer)
 	if err != nil {
 		return nil, err
 	}
 
-	hostTemplate.IPAddresses = rawCsr.IPAddresses
-	hostTemplate.DNSNames = rawCsr.DNSNames
-	hostTemplate.URIs = rawCsr.URIs
-
-	rawCrtAuth, err := crtAuth.GetRawCertificate()
-	if err != nil {
-		return nil, err
-	}
-
-	crtHostBytes, err := x509.CreateCertificate(rand.Reader, &hostTemplate, rawCrtAuth, rawCsr.PublicKey, keyAuth.Private)
-	if err != nil {
-		return nil, err
-	}
-
-	return NewCertificateFromDER(crtHostBytes), nil
+	return finalizeIssuedCertificate(crtHostBytes, request, rawCrtAuth, false)
 }

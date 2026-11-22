@@ -88,6 +88,15 @@ func CreateIntermediateCertificateAuthority(crtAuth *Certificate, keyAuth *Key, 
 // CreateIntermediateCertificateAuthorityWithOptions creates an intermediate with options.
 // CA certificate signed by the given authority.
 func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest, proposedExpiry time.Time, opts ...Option) (*Certificate, error) {
+	request, err := certificateRequestForIssuance(csr)
+	if err != nil {
+		return nil, err
+	}
+	rawCrtAuth, signer, err := authorizeCA(crtAuth, keyAuth)
+	if err != nil {
+		return nil, err
+	}
+
 	authTemplate := newAuthTemplate()
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
@@ -95,45 +104,26 @@ func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, key
 	if err != nil {
 		return nil, err
 	}
-	authTemplate.SerialNumber.Set(serialNumber)
+	authTemplate.SerialNumber = serialNumber
 
-	rawCsr, err := csr.GetRawCertificateSigningRequest()
-	if err != nil {
-		return nil, err
-	}
-
-	authTemplate.RawSubject = rawCsr.RawSubject
-
-	caExpiry := time.Now().Add(crtAuth.GetExpirationDuration())
-	// ensure cert doesn't expire after issuer
-	if caExpiry.Before(proposedExpiry) {
-		authTemplate.NotAfter = caExpiry
-	} else {
-		authTemplate.NotAfter = proposedExpiry
-	}
-
-	authTemplate.SubjectKeyId, err = GenerateSubjectKeyID(rawCsr.PublicKey)
-	if err != nil {
-		return nil, err
-	}
-
-	authTemplate.IPAddresses = rawCsr.IPAddresses
-	authTemplate.DNSNames = rawCsr.DNSNames
-	authTemplate.URIs = rawCsr.URIs
-
-	rawCrtAuth, err := crtAuth.GetRawCertificate()
-	if err != nil {
-		return nil, err
-	}
+	authTemplate.RawSubject = append([]byte(nil), request.rawSubject...)
+	// Ensure the certificate does not expire after its issuer.
+	authTemplate.NotAfter = certificateNotAfter(rawCrtAuth, proposedExpiry)
+	authTemplate.SubjectKeyId = append([]byte(nil), request.subjectKeyID...)
+	authTemplate.AuthorityKeyId = append([]byte(nil), rawCrtAuth.SubjectKeyId...)
+	authTemplate.IPAddresses = cloneIPs(request.ipAddresses)
+	authTemplate.DNSNames = cloneStrings(request.dnsNames)
+	authTemplate.EmailAddresses = cloneStrings(request.emailAddresses)
+	authTemplate.URIs = cloneURLs(request.uris)
 
 	applyOptions(&authTemplate, opts)
 
-	crtOutBytes, err := x509.CreateCertificate(rand.Reader, &authTemplate, rawCrtAuth, rawCsr.PublicKey, keyAuth.Private)
+	crtOutBytes, err := x509.CreateCertificate(rand.Reader, &authTemplate, rawCrtAuth, request.publicKey, signer)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewCertificateFromDER(crtOutBytes), nil
+	return finalizeIssuedCertificate(crtOutBytes, request, rawCrtAuth, true)
 }
 
 // WithPathlenOption will check if the certificate should have `pathlen` or not.

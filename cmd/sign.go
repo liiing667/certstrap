@@ -109,6 +109,13 @@ func newSignAction(c *cli.Context) {
 		fmt.Fprintln(os.Stderr, "Get certificate request error:", err)
 		os.Exit(1)
 	}
+	// Check proof of possession before the request can influence any CA
+	// operation or output. The pkix issuance functions repeat this check from
+	// their own immutable request snapshot.
+	if err = csr.CheckSignature(); err != nil {
+		fmt.Fprintln(os.Stderr, "Verify certificate request error:", err)
+		os.Exit(1)
+	}
 	crt, err := depot.GetCertificate(d, formattedCAName)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Get CA certificate error:", err)
