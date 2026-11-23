@@ -205,3 +205,53 @@ func TestCheckPermissions(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateName checks that names escaping the depot root are rejected
+// while ordinary host and CA names are accepted.
+func TestValidateName(t *testing.T) {
+	valid := []string{"host", "host.pem", "my-host.example.com", "CA_2", "a.b.c", "sub/host.pem"}
+	for _, name := range valid {
+		if err := ValidateName(name); err != nil {
+			t.Errorf("Expected name %q to be valid, got %v", name, err)
+		}
+	}
+
+	invalid := []string{"", ".", "..", "../escape.pem", "sub/../../escape.pem", "sub/../../../escape.pem", "/abs/path.pem"}
+	for _, name := range invalid {
+		if err := ValidateName(name); err == nil {
+			t.Errorf("Expected name %q to be rejected", name)
+		}
+	}
+}
+
+// TestDepotRejectsEscapingNames checks that no depot operation can read or
+// write an object outside the depot root through parent-directory references.
+func TestDepotRejectsEscapingNames(t *testing.T) {
+	d := getDepot(t)
+	defer os.RemoveAll(dir)
+	defer os.Remove("escape.pem")
+
+	badNames := []string{"..", "../escape.pem", "sub/../../escape.pem", "/escape.pem"}
+	for _, name := range badNames {
+		bad := &Tag{name, 0600}
+		if err := d.Put(bad, []byte(data)); err == nil {
+			t.Errorf("Expected Put to reject name %q", name)
+		}
+		if _, err := d.Get(bad); err == nil {
+			t.Errorf("Expected Get to reject name %q", name)
+		}
+		if _, err := d.GetFile(bad); err == nil {
+			t.Errorf("Expected GetFile to reject name %q", name)
+		}
+		if d.Check(bad) {
+			t.Errorf("Expected Check to reject name %q", name)
+		}
+		if err := d.Delete(bad); err == nil {
+			t.Errorf("Expected Delete to reject name %q", name)
+		}
+	}
+
+	if _, err := os.Lstat("escape.pem"); !os.IsNotExist(err) {
+		t.Fatal("A depot operation created a file outside the depot")
+	}
+}

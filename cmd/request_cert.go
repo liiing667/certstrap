@@ -140,6 +140,11 @@ func newCertAction(c *cli.Context) {
 
 	var formattedName = formatName(name)
 
+	if err := depot.ValidateName(formattedName); err != nil {
+		fmt.Fprintln(os.Stderr, "Invalid host name:", err)
+		os.Exit(1)
+	}
+
 	// skip the check if the --csr option is specified
 	if !c.IsSet("csr") && (depot.CheckCertificateSigningRequest(d, formattedName) || depot.CheckPrivateKey(d, formattedName)) {
 		fmt.Fprintf(os.Stderr, "Certificate request \"%s\" already exists!\n", formattedName)

@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const (
@@ -67,8 +68,73 @@ func NewFileDepot(dir string) (*FileDepot, error) {
 	return &FileDepot{dirpath}, nil
 }
 
-func (d *FileDepot) path(name string) string {
-	return filepath.Join(d.dirPath, name)
+// ValidateName returns an error if name cannot identify an object stored in
+// a depot. Depot object names must be relative and must not climb out of the
+// depot root through parent-directory references, so that a name always
+// identifies one object confined to the depot.
+func ValidateName(name string) error {
+	if name == "" {
+		return errors.New("empty depot object name")
+	}
+	if filepath.IsAbs(name) || filepath.VolumeName(name) != "" {
+		return fmt.Errorf("invalid depot object name %q: absolute paths are not allowed", name)
+	}
+	if cleaned := filepath.Clean(name); cleaned == "." || cleaned == ".." ||
+		strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("invalid depot object name %q: name escapes the depot", name)
+	}
+	return nil
+}
+
+// resolvePath returns the canonical location of path: symlinks in every
+// existing component are resolved, and components that do not exist yet are
+// appended to the resolved location of their deepest existing ancestor.
+func resolvePath(path string) (string, error) {
+	components := []string{}
+	current := path
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			return filepath.Join(append([]string{resolved}, components...)...), nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("cannot resolve path %q", path)
+		}
+		components = append([]string{filepath.Base(current)}, components...)
+		current = parent
+	}
+}
+
+// resolve maps name to the absolute path of the depot object it identifies.
+// The returned path is guaranteed to stay inside the depot root: the name
+// must be relative and free of parent-directory references, and the depot
+// directory and every existing path component are resolved, so that neither
+// a path alias for the depot nor a symlink swapped in for a depot object can
+// redirect the object outside the depot root. All file operations and error
+// messages use this single resolved identity.
+func (d *FileDepot) resolve(name string) (string, error) {
+	if err := ValidateName(name); err != nil {
+		return "", err
+	}
+
+	// Resolve the depot root itself, so that a depot reached through a
+	// symlink or path alias is compared by its real location.
+	root, err := resolvePath(d.dirPath)
+	if err != nil {
+		return "", err
+	}
+
+	resolved, err := resolvePath(filepath.Join(d.dirPath, name))
+	if err != nil {
+		return "", err
+	}
+
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid depot object name %q: path escapes the depot", name)
+	}
+	return resolved, nil
 }
 
 // Put inserts the data into the file specified by the tag
@@ -81,7 +147,11 @@ func (d *FileDepot) Put(tag *Tag, data []byte) error {
 		return err
 	}
 
-	name := d.path(tag.name)
+	name, err := d.resolve(tag.name)
+	if err != nil {
+		return err
+	}
+
 	perm := tag.perm
 
 	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
@@ -101,23 +171,29 @@ func (d *FileDepot) Put(tag *Tag, data []byte) error {
 
 // Check returns whether the file at the tag location exists and has permissions at least as restrictive as the given tag.
 func (d *FileDepot) Check(tag *Tag) bool {
-	name := d.path(tag.name)
+	name, err := d.resolve(tag.name)
+	if err != nil {
+		return false
+	}
 	if fi, err := os.Stat(name); err == nil && checkPermissions(tag.perm, fi.Mode()) {
 		return true
 	}
 	return false
 }
 
-func (d *FileDepot) check(tag *Tag) error {
-	name := d.path(tag.name)
+func (d *FileDepot) check(tag *Tag) (string, error) {
+	name, err := d.resolve(tag.name)
+	if err != nil {
+		return "", err
+	}
 	fi, err := os.Stat(name)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !checkPermissions(tag.perm, fi.Mode()) {
-		return fmt.Errorf("permissions too lax for %v: required no more than %v, found %v", name, tag.perm, fi.Mode())
+		return "", fmt.Errorf("permissions too lax for %v: required no more than %v, found %v", name, tag.perm, fi.Mode())
 	}
-	return nil
+	return name, nil
 }
 
 // checkPermissions returns true if the mode bits in file are a subset of required.
@@ -128,15 +204,21 @@ func checkPermissions(required, file fs.FileMode) bool {
 
 // Get reads the file specified by the tag
 func (d *FileDepot) Get(tag *Tag) ([]byte, error) {
-	if err := d.check(tag); err != nil {
+	name, err := d.check(tag)
+	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(d.path(tag.name))
+	return os.ReadFile(name)
 }
 
 // Delete removes the file specified by the tag
 func (d *FileDepot) Delete(tag *Tag) error {
-	return os.Remove(d.path(tag.name))
+	if _, err := d.resolve(tag.name); err != nil {
+		return err
+	}
+	// Remove the depot entry itself rather than following a final symlink;
+	// resolve already verified that the object stays inside the depot.
+	return os.Remove(filepath.Join(d.dirPath, tag.name))
 }
 
 // List returns all tags in the specified depot
@@ -173,13 +255,14 @@ type File struct {
 
 // GetFile returns the File at the specified tag in the given depot
 func (d *FileDepot) GetFile(tag *Tag) (*File, error) {
-	if err := d.check(tag); err != nil {
-		return nil, err
-	}
-	fi, err := os.Stat(d.path(tag.name))
+	name, err := d.check(tag)
 	if err != nil {
 		return nil, err
 	}
-	b, err := os.ReadFile(d.path(tag.name))
+	fi, err := os.Stat(name)
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(name)
 	return &File{fi, b}, err
 }

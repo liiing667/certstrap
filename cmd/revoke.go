@@ -55,11 +55,17 @@ func (c *revokeCommand) parseArgs(ctx *cli.Context) error {
 		return errors.New("CA name must be provided")
 	}
 	c.ca = strings.Replace(ctx.String("CA"), " ", "_", -1)
+	if err := depot.ValidateName(c.ca); err != nil {
+		return fmt.Errorf("invalid CA name: %v", err)
+	}
 
 	if ctx.String("CN") == "" {
 		return errors.New("CN name must be provided")
 	}
 	c.cn = strings.Replace(ctx.String("CN"), " ", "_", -1)
+	if err := depot.ValidateName(c.cn); err != nil {
+		return fmt.Errorf("invalid CN name: %v", err)
+	}
 
 	return nil
 }

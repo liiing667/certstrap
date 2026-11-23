@@ -86,6 +86,15 @@ func newSignAction(c *cli.Context) {
 	formattedReqName := strings.Replace(c.Args()[0], " ", "_", -1)
 	formattedCAName := strings.Replace(c.String("CA"), " ", "_", -1)
 
+	if err := depot.ValidateName(formattedReqName); err != nil {
+		fmt.Fprintln(os.Stderr, "Invalid host name:", err)
+		os.Exit(1)
+	}
+	if err := depot.ValidateName(formattedCAName); err != nil {
+		fmt.Fprintln(os.Stderr, "Invalid CA name:", err)
+		os.Exit(1)
+	}
+
 	if depot.CheckCertificate(d, formattedReqName) {
 		fmt.Fprintf(os.Stderr, "Certificate \"%s\" already exists!\n", formattedReqName)
 		os.Exit(1)

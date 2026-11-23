@@ -114,6 +114,11 @@ func initAction(c *cli.Context) {
 
 	formattedName := strings.Replace(c.String("common-name"), " ", "_", -1)
 
+	if err := depot.ValidateName(formattedName); err != nil {
+		fmt.Fprintln(os.Stderr, "Invalid CA name:", err)
+		os.Exit(1)
+	}
+
 	if depot.CheckCertificate(d, formattedName) || depot.CheckPrivateKey(d, formattedName) {
 		fmt.Fprintf(os.Stderr, "CA with specified name \"%s\" already exists!\n", formattedName)
 		os.Exit(1)
