@@ -18,6 +18,7 @@
 package pkix
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -25,15 +26,21 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
+	"reflect"
 
 	"go.step.sm/crypto/pemutil"
 )
+
+// ErrKeyIdentityMismatch reports that a Key's public and private halves do
+// not describe the same key.
+var ErrKeyIdentityMismatch = errors.New("key public key does not match private key")
 
 const (
 	rsaPrivateKeyPEMBlockType            = "RSA PRIVATE KEY"
@@ -78,12 +85,272 @@ type Key struct {
 }
 
 func NewKeyFromSigner(signer crypto.Signer) *Key {
+	if isNilValue(signer) {
+		return &Key{Private: signer}
+	}
 	return &Key{Public: signer.Public(), Private: signer}
 }
 
-// NewKey returns a new public-private keypair Key type
+// NewKey returns a new public-private keypair Key type. If the public half is
+// omitted it is derived from the private half when that is safe to do.
 func NewKey(pub crypto.PublicKey, priv crypto.PrivateKey) *Key {
+	if isNilValue(pub) && !isNilValue(priv) {
+		if signer, ok := priv.(crypto.Signer); ok {
+			switch ed := priv.(type) {
+			case ed25519.PrivateKey:
+				if len(ed) == ed25519.PrivateKeySize {
+					pub = signer.Public()
+				}
+			case *ed25519.PrivateKey:
+				if ed != nil && len(*ed) == ed25519.PrivateKeySize {
+					pub = signer.Public()
+				}
+			default:
+				pub = signer.Public()
+			}
+		}
+	}
 	return &Key{Public: pub, Private: priv}
+}
+
+// Signer returns the private key as a crypto.Signer. It fails closed for a
+// missing key or an Ed25519 private key with an invalid length instead of
+// letting a malformed key panic when its public half is derived.
+func (k *Key) Signer() (crypto.Signer, error) {
+	if k == nil || isNilValue(k.Private) {
+		return nil, errors.New("private key is missing")
+	}
+	switch ed := k.Private.(type) {
+	case ed25519.PrivateKey:
+		if len(ed) != ed25519.PrivateKeySize {
+			return nil, fmt.Errorf("Ed25519 private key has invalid length %d, want %d", len(ed), ed25519.PrivateKeySize)
+		}
+	case *ed25519.PrivateKey:
+		if ed == nil || len(*ed) != ed25519.PrivateKeySize {
+			return nil, fmt.Errorf("Ed25519 private key has invalid length, want %d", ed25519.PrivateKeySize)
+		}
+	}
+	signer, ok := k.Private.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("private key type %T does not implement crypto.Signer", k.Private)
+	}
+	return signer, nil
+}
+
+// PublicKey returns the public key belonging to the private key. When both
+// halves are present they must agree; a Key is never allowed to describe one
+// algorithm publicly while signing with another.
+func (k *Key) PublicKey() (crypto.PublicKey, error) {
+	signer, err := k.Signer()
+	if err != nil {
+		return nil, err
+	}
+	derived := signer.Public()
+	if err := validatePublicKey(derived); err != nil {
+		return nil, fmt.Errorf("private key public half: %w", err)
+	}
+	if isNilValue(k.Public) {
+		return derived, nil
+	}
+	if err := validatePublicKey(k.Public); err != nil {
+		return nil, fmt.Errorf("key public half: %w", err)
+	}
+	match, err := PublicKeysEqual(k.Public, derived)
+	if err != nil {
+		return nil, err
+	}
+	if !match {
+		return nil, ErrKeyIdentityMismatch
+	}
+	return k.Public, nil
+}
+
+// Validate verifies that the key describes one usable private/public pair and
+// that the private half is structurally sound. All certificate and CRL
+// creation goes through this check so a key cannot be exported or used with an
+// unrelated certificate.
+func (k *Key) Validate() error {
+	if _, err := k.Signer(); err != nil {
+		return err
+	}
+	switch priv := k.Private.(type) {
+	case *rsa.PrivateKey:
+		if err := priv.Validate(); err != nil {
+			return fmt.Errorf("invalid RSA private key: %w", err)
+		}
+	case *ecdsa.PrivateKey:
+		if priv.Curve == nil || priv.D == nil || priv.X == nil || priv.Y == nil {
+			return errors.New("invalid ECDSA private key: missing curve or point")
+		}
+		// Sign and verify a fixed digest to prove the private scalar and public
+		// point belong together without relying on the deprecated low-level
+		// elliptic.Curve operations.
+		digest := sha256.Sum256([]byte("certstrap ECDSA key validation"))
+		sig, err := ecdsa.SignASN1(rand.Reader, priv, digest[:])
+		if err != nil {
+			return fmt.Errorf("invalid ECDSA private key: %w", err)
+		}
+		if !ecdsa.VerifyASN1(&priv.PublicKey, digest[:], sig) {
+			return errors.New("invalid ECDSA private key: public point does not match private scalar")
+		}
+	case ed25519.PrivateKey:
+		if len(priv) != ed25519.PrivateKeySize {
+			return fmt.Errorf("invalid Ed25519 private key length %d, want %d", len(priv), ed25519.PrivateKeySize)
+		}
+	case *ed25519.PrivateKey:
+		if priv == nil || len(*priv) != ed25519.PrivateKeySize {
+			return fmt.Errorf("invalid Ed25519 private key length, want %d", ed25519.PrivateKeySize)
+		}
+	}
+	pub, err := k.PublicKey()
+	if err != nil {
+		return err
+	}
+	return validatePublicKey(pub)
+}
+
+// exportEvidence describes the public identity available on a key for export
+// failures. It deliberately does not expose private key material.
+func (k *Key) exportEvidence() string {
+	fingerprint := "unknown"
+	algorithm := "unknown"
+	if k != nil {
+		if value, err := k.Fingerprint(); err == nil {
+			fingerprint = value
+		} else if k.Public != nil {
+			if value, err := PublicKeyFingerprint(k.Public); err == nil {
+				fingerprint = value
+			}
+		}
+		if value, err := k.Algorithm(); err == nil {
+			algorithm = value
+		} else if k.Public != nil {
+			if value, err := PublicKeyAlgorithm(k.Public); err == nil {
+				algorithm = value
+			}
+		}
+	}
+	return fmt.Sprintf("key_fingerprint=%s algorithm=%s", fingerprint, algorithm)
+}
+
+// Fingerprint returns a stable SHA-256 identity for the key's public half.
+func (k *Key) Fingerprint() (string, error) {
+	pub, err := k.PublicKey()
+	if err != nil {
+		return "", err
+	}
+	return PublicKeyFingerprint(pub)
+}
+
+// Algorithm returns the algorithm of the key's validated public half.
+func (k *Key) Algorithm() (string, error) {
+	pub, err := k.PublicKey()
+	if err != nil {
+		return "", err
+	}
+	return PublicKeyAlgorithm(pub)
+}
+
+// MatchesPublicKey reports whether pub is the key's validated public half.
+func (k *Key) MatchesPublicKey(pub crypto.PublicKey) (bool, error) {
+	own, err := k.PublicKey()
+	if err != nil {
+		return false, err
+	}
+	return PublicKeysEqual(own, pub)
+}
+
+// PublicKeyFingerprint returns a stable SHA-256 identity for a public key.
+func PublicKeyFingerprint(pub crypto.PublicKey) (string, error) {
+	if err := validatePublicKey(pub); err != nil {
+		return "", err
+	}
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return "", fmt.Errorf("marshal public key %T: %w", pub, err)
+	}
+	sum := sha256.Sum256(der)
+	return fmt.Sprintf("sha256:%x", sum[:]), nil
+}
+
+// PublicKeysEqual reports whether two public keys have the same PKIX encoding.
+func PublicKeysEqual(a, b crypto.PublicKey) (bool, error) {
+	if isNilValue(a) || isNilValue(b) {
+		return false, errors.New("public key is missing")
+	}
+	if err := validatePublicKey(a); err != nil {
+		return false, err
+	}
+	if err := validatePublicKey(b); err != nil {
+		return false, err
+	}
+	aDER, err := x509.MarshalPKIXPublicKey(a)
+	if err != nil {
+		return false, fmt.Errorf("marshal public key %T: %w", a, err)
+	}
+	bDER, err := x509.MarshalPKIXPublicKey(b)
+	if err != nil {
+		return false, fmt.Errorf("marshal public key %T: %w", b, err)
+	}
+	return bytes.Equal(aDER, bDER), nil
+}
+
+// PublicKeyAlgorithm returns the key algorithm for a supported public key.
+func PublicKeyAlgorithm(pub crypto.PublicKey) (string, error) {
+	if isNilValue(pub) {
+		return "", errors.New("public key is missing")
+	}
+	switch pub.(type) {
+	case *rsa.PublicKey:
+		return "RSA", nil
+	case *ecdsa.PublicKey:
+		return "ECDSA", nil
+	case ed25519.PublicKey:
+		return "Ed25519", nil
+	default:
+		return "", fmt.Errorf("unsupported public key type %T", pub)
+	}
+}
+
+func validatePublicKey(pub crypto.PublicKey) error {
+	if isNilValue(pub) {
+		return errors.New("public key is missing")
+	}
+	switch pub := pub.(type) {
+	case *rsa.PublicKey:
+		if pub.N == nil || pub.N.Sign() <= 0 || pub.E < 2 {
+			return errors.New("invalid RSA public key")
+		}
+	case *ecdsa.PublicKey:
+		if pub.Curve == nil || pub.X == nil || pub.Y == nil {
+			return errors.New("invalid ECDSA public key: missing curve or point")
+		}
+		if _, err := x509.MarshalPKIXPublicKey(pub); err != nil {
+			return fmt.Errorf("invalid ECDSA public key: %w", err)
+		}
+	case ed25519.PublicKey:
+		if len(pub) != ed25519.PublicKeySize {
+			return fmt.Errorf("invalid Ed25519 public key length %d, want %d", len(pub), ed25519.PublicKeySize)
+		}
+	default:
+		return fmt.Errorf("unsupported public key type %T", pub)
+	}
+	return nil
+}
+
+// isNilValue reports whether value is nil, including typed nil pointers and
+// typed nil slices that implement crypto.Signer or crypto.PublicKey.
+func isNilValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	v := reflect.ValueOf(value)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
 }
 
 // NewKeyFromPrivateKeyPEM inits Key from PEM-format rsa private key bytes
@@ -105,7 +372,11 @@ func NewKeyFromPrivateKeyPEM(data []byte) (*Key, error) {
 		if err != nil {
 			return nil, err
 		}
-		signer = priv.(crypto.Signer)
+		parsed, ok := priv.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("unsupported private key type %T", priv)
+		}
+		signer = parsed
 	default:
 		return nil, fmt.Errorf("unknown PEM block type %q", pemBlock.Type)
 	}
@@ -139,7 +410,11 @@ func NewKeyFromEncryptedPrivateKeyPEM(data []byte, password []byte) (*Key, error
 		if err != nil {
 			return nil, err
 		}
-		signer = priv.(crypto.Signer)
+		parsed, ok := priv.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("unsupported private key type %T", priv)
+		}
+		signer = parsed
 	default:
 		return nil, fmt.Errorf("unsupported PEM block type %q", pemBlock.Type)
 	}
@@ -150,6 +425,9 @@ func NewKeyFromEncryptedPrivateKeyPEM(data []byte, password []byte) (*Key, error
 // ExportPrivate exports PEM-format private key. RSA keys are exported
 // as PKCS#1, ECDSA and Ed25519 keys are exported as PKCS#8.
 func (k *Key) ExportPrivate() ([]byte, error) {
+	if err := k.Validate(); err != nil {
+		return nil, fmt.Errorf("private key export rejected (%s passphrase_stage=plaintext): %w", k.exportEvidence(), err)
+	}
 	var privPEMBlock *pem.Block
 	switch priv := k.Private.(type) {
 	case *rsa.PrivateKey:
@@ -167,6 +445,15 @@ func (k *Key) ExportPrivate() ([]byte, error) {
 			Type:  pkcs8PrivateKeyPEMBlockType,
 			Bytes: privBytes,
 		}
+	case *ed25519.PrivateKey:
+		privBytes, err := x509.MarshalPKCS8PrivateKey(*priv)
+		if err != nil {
+			return nil, err
+		}
+		privPEMBlock = &pem.Block{
+			Type:  pkcs8PrivateKeyPEMBlockType,
+			Bytes: privBytes,
+		}
 	default:
 		return nil, fmt.Errorf("unsupported key type %T", k.Private)
 	}
@@ -176,6 +463,9 @@ func (k *Key) ExportPrivate() ([]byte, error) {
 
 // ExportEncryptedPrivate exports encrypted PEM-format private key
 func (k *Key) ExportEncryptedPrivate(password []byte) ([]byte, error) {
+	if err := k.Validate(); err != nil {
+		return nil, fmt.Errorf("encrypted private key export rejected (%s passphrase_stage=encrypt): %w", k.exportEvidence(), err)
+	}
 	var privPEMBlock *pem.Block
 	switch priv := k.Private.(type) {
 	case *rsa.PrivateKey:
@@ -187,6 +477,16 @@ func (k *Key) ExportEncryptedPrivate(password []byte) ([]byte, error) {
 		privPEMBlock = block
 	case *ecdsa.PrivateKey, ed25519.PrivateKey:
 		privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+		if err != nil {
+			return nil, err
+		}
+		block, err := pemutil.EncryptPKCS8PrivateKey(rand.Reader, privBytes, password, x509.PEMCipherAES256)
+		if err != nil {
+			return nil, err
+		}
+		privPEMBlock = block
+	case *ed25519.PrivateKey:
+		privBytes, err := x509.MarshalPKCS8PrivateKey(*priv)
 		if err != nil {
 			return nil, err
 		}

@@ -18,6 +18,8 @@
 package cmd
 
 import (
+	"crypto/ecdsa"
+	"crypto/x509"
 	"fmt"
 	"os"
 	"strings"
@@ -106,6 +108,36 @@ func NewInitCommand() cli.Command {
 	}
 }
 
+// curveChangesExistingCA reports whether the requested curve describes a
+// different public-key algorithm than the already stored CA certificate. A
+// recurring init with the same algorithm keeps the historical duplicate-name
+// refusal; a genuine RSA-to-ECDSA (or ECDSA-to-Ed25519) migration is allowed.
+func curveChangesExistingCA(d *depot.FileDepot, name, curve string) bool {
+	crt, err := depot.GetCertificate(d, name)
+	if err != nil {
+		return false
+	}
+	raw, err := crt.GetRawCertificate()
+	if err != nil {
+		return false
+	}
+	switch curve {
+	case "Ed25519":
+		return raw.PublicKeyAlgorithm != x509.Ed25519
+	case "P-224", "P-256", "P-384", "P-521":
+		if raw.PublicKeyAlgorithm != x509.ECDSA {
+			return true
+		}
+		pub, ok := raw.PublicKey.(*ecdsa.PublicKey)
+		if !ok || pub.Curve == nil || pub.Curve.Params() == nil {
+			return true
+		}
+		return pub.Curve.Params().Name != curve
+	default:
+		return false
+	}
+}
+
 func initAction(c *cli.Context) {
 	if !c.IsSet("common-name") {
 		fmt.Println("Must supply Common Name for CA")
@@ -114,7 +146,13 @@ func initAction(c *cli.Context) {
 
 	formattedName := strings.Replace(c.String("common-name"), " ", "_", -1)
 
-	if depot.CheckCertificate(d, formattedName) || depot.CheckPrivateKey(d, formattedName) {
+	haveCertificate := d.Exists(depot.CrtTag(formattedName))
+	havePrivateKey := d.Exists(depot.PrivKeyTag(formattedName))
+	migrationRequested := c.IsSet("key")
+	if c.IsSet("curve") && !migrationRequested {
+		migrationRequested = curveChangesExistingCA(d, formattedName, c.String("curve"))
+	}
+	if haveCertificate && havePrivateKey && !migrationRequested {
 		fmt.Fprintf(os.Stderr, "CA with specified name \"%s\" already exists!\n", formattedName)
 		os.Exit(1)
 	}
@@ -150,6 +188,7 @@ func initAction(c *cli.Context) {
 	}
 
 	var key *pkix.Key
+	keyGenerated := !c.IsSet("key")
 	switch {
 	case c.IsSet("key"):
 		keyBytes, err := os.ReadFile(c.String("key"))
@@ -171,21 +210,11 @@ func initAction(c *cli.Context) {
 			fmt.Fprintf(os.Stderr, "Create %s Key error: %v\n", curve, err)
 			os.Exit(1)
 		}
-		if len(passphrase) > 0 {
-			fmt.Printf("Created %s/%s.key (encrypted by passphrase)\n", depotDir, formattedName)
-		} else {
-			fmt.Printf("Created %s/%s.key\n", depotDir, formattedName)
-		}
 	default:
 		key, err = pkix.CreateRSAKey(c.Int("key-bits"))
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Create RSA Key error:", err)
 			os.Exit(1)
-		}
-		if len(passphrase) > 0 {
-			fmt.Printf("Created %s/%s.key (encrypted by passphrase)\n", depotDir, formattedName)
-		} else {
-			fmt.Printf("Created %s/%s.key\n", depotDir, formattedName)
 		}
 	}
 
@@ -194,34 +223,9 @@ func initAction(c *cli.Context) {
 	}
 
 	crt, err := pkix.CreateCertificateAuthorityWithOptions(key, c.String("organizational-unit"), expiresTime, c.String("organization"), c.String("country"), c.String("province"), c.String("locality"), c.String("common-name"), c.StringSlice("permit-domain"), opts...)
-
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Create certificate error:", err)
 		os.Exit(1)
-	}
-	fmt.Printf("Created %s/%s.crt\n", depotDir, formattedName)
-
-	if c.Bool("stdout") {
-		crtBytes, err := crt.Export()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Print CA certificate error:", err)
-			os.Exit(1)
-		} else {
-			fmt.Println(string(crtBytes))
-		}
-	}
-
-	if err = depot.PutCertificate(d, formattedName, crt); err != nil {
-		fmt.Fprintln(os.Stderr, "Save certificate error:", err)
-	}
-	if len(passphrase) > 0 {
-		if err = depot.PutEncryptedPrivateKey(d, formattedName, key, passphrase); err != nil {
-			fmt.Fprintln(os.Stderr, "Save encrypted private key error:", err)
-		}
-	} else {
-		if err = depot.PutPrivateKey(d, formattedName, key); err != nil {
-			fmt.Fprintln(os.Stderr, "Save private key error:", err)
-		}
 	}
 
 	// Create an empty CRL, this is useful for Java apps which mandate a CRL.
@@ -230,9 +234,52 @@ func initAction(c *cli.Context) {
 		fmt.Fprintln(os.Stderr, "Create CRL error:", err)
 		os.Exit(1)
 	}
-	if err = depot.PutCertificateRevocationList(d, formattedName, crl); err != nil {
+
+	var crtBytes []byte
+	if c.Bool("stdout") {
+		crtBytes, err = crt.Export()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Print CA certificate error:", err)
+			os.Exit(1)
+		}
+	}
+
+	// Stage the key, certificate and CRL as one generation. The key export
+	// (including encryption) runs before anything is published, so a failed or
+	// retried passphrase write cannot leave a certificate paired with old key
+	// material.
+	txn := depot.NewTxn(d)
+	// A CA generation is one matching key/certificate pair. PutKeyPairInTxn
+	// validates the pair, replaces existing files atomically, and keeps the
+	// previous generation intact when export or commit fails.
+	if err = depot.PutKeyPairInTxn(txn, formattedName, key, crt, passphrase); err != nil {
+		fmt.Fprintln(os.Stderr, "Save CA error:", err)
+		os.Exit(1)
+	}
+	if d.Exists(depot.CrlTag(formattedName)) {
+		if err = depot.ReplaceCertificateRevocationListInTxn(txn, formattedName, crl); err != nil {
+			fmt.Fprintln(os.Stderr, "Save CRL error:", err)
+			os.Exit(1)
+		}
+	} else if err = depot.PutCertificateRevocationListInTxn(txn, formattedName, crl); err != nil {
 		fmt.Fprintln(os.Stderr, "Save CRL error:", err)
 		os.Exit(1)
+	}
+	if err = txn.Commit(); err != nil {
+		fmt.Fprintln(os.Stderr, "Save CA error:", err)
+		os.Exit(1)
+	}
+
+	if keyGenerated {
+		if len(passphrase) > 0 {
+			fmt.Printf("Created %s/%s.key (encrypted by passphrase)\n", depotDir, formattedName)
+		} else {
+			fmt.Printf("Created %s/%s.key\n", depotDir, formattedName)
+		}
+	}
+	fmt.Printf("Created %s/%s.crt\n", depotDir, formattedName)
+	if c.Bool("stdout") {
+		fmt.Println(string(crtBytes))
 	}
 	fmt.Printf("Created %s/%s.crl\n", depotDir, formattedName)
 }

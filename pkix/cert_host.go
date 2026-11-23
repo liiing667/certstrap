@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"math/big"
 	"time"
 )
@@ -28,6 +29,10 @@ import (
 // CreateCertificateHost creates certificate for host.
 // The arguments include CA certificate, CA key, certificate request.
 func CreateCertificateHost(crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest, proposedExpiry time.Time) (*Certificate, error) {
+	if err := crtAuth.ValidateKey(keyAuth); err != nil {
+		return nil, fmt.Errorf("CA key does not match CA certificate (%s): %w", keyAuth.exportEvidence(), err)
+	}
+
 	// Build CA based on RFC5280
 	hostTemplate := x509.Certificate{
 		// **SHOULD** be filled in a unique number

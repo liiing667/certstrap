@@ -20,6 +20,7 @@ package pkix
 import (
 	"crypto/rand"
 	"crypto/x509"
+	"fmt"
 	"math/big"
 	"time"
 )
@@ -36,9 +37,17 @@ func CreateCertificateAuthority(key *Key, organizationalUnit string, expiry time
 // CreateCertificateAuthorityWithOptions creates Certificate Authority using existing key with options.
 // CertificateAuthorityInfo returned is the extra infomation required by Certificate Authority.
 func CreateCertificateAuthorityWithOptions(key *Key, organizationalUnit string, expiry time.Time, organization string, country string, province string, locality string, commonName string, permitDomains []string, opts ...Option) (*Certificate, error) {
+	if err := key.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid CA key (%s): %w", key.exportEvidence(), err)
+	}
+	publicKey, err := key.PublicKey()
+	if err != nil {
+		return nil, fmt.Errorf("invalid CA key (%s): %w", key.exportEvidence(), err)
+	}
+
 	authTemplate := newAuthTemplate()
 
-	subjectKeyID, err := GenerateSubjectKeyID(key.Public)
+	subjectKeyID, err := GenerateSubjectKeyID(publicKey)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +79,7 @@ func CreateCertificateAuthorityWithOptions(key *Key, organizationalUnit string, 
 
 	applyOptions(&authTemplate, opts)
 
-	crtBytes, err := x509.CreateCertificate(rand.Reader, &authTemplate, &authTemplate, key.Public, key.Private)
+	crtBytes, err := x509.CreateCertificate(rand.Reader, &authTemplate, &authTemplate, publicKey, key.Private)
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +98,9 @@ func CreateIntermediateCertificateAuthority(crtAuth *Certificate, keyAuth *Key, 
 // CA certificate signed by the given authority.
 func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest, proposedExpiry time.Time, opts ...Option) (*Certificate, error) {
 	authTemplate := newAuthTemplate()
+	if err := crtAuth.ValidateKey(keyAuth); err != nil {
+		return nil, fmt.Errorf("CA key does not match CA certificate (%s): %w", keyAuth.exportEvidence(), err)
+	}
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
@@ -125,7 +137,6 @@ func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, key
 	if err != nil {
 		return nil, err
 	}
-
 	applyOptions(&authTemplate, opts)
 
 	crtOutBytes, err := x509.CreateCertificate(rand.Reader, &authTemplate, rawCrtAuth, rawCsr.PublicKey, keyAuth.Private)

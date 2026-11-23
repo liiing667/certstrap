@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"crypto"
 	"crypto/rand"
 	"crypto/x509"
 	"errors"
@@ -114,9 +113,17 @@ func (c *revokeCommand) revocationList() (*x509.RevocationList, error) {
 func (c *revokeCommand) saveRevokedCertificates(ctx *cli.Context, cert *x509.Certificate, template *x509.RevocationList) error {
 	privateKey, err := depot.GetPrivateKey(d, c.ca)
 	if err != nil {
-		pass, err := getPassPhrase(ctx, "CA key")
-		if err != nil {
-			return fmt.Errorf("error retreiving passphrase when saving revoked certificates: %v", err)
+		var identityErr *depot.StoredIdentityError
+		if errors.As(err, &identityErr) {
+			return fmt.Errorf("get CA key error when saving revoked certificates: %v", err)
+		}
+		encrypted, encryptedErr := depot.IsEncryptedPrivateKey(d, c.ca)
+		if encryptedErr != nil || !encrypted {
+			return fmt.Errorf("get CA key error when saving revoked certificates: %v", err)
+		}
+		pass, passErr := getPassPhrase(ctx, "CA key")
+		if passErr != nil {
+			return fmt.Errorf("error retreiving passphrase when saving revoked certificates: %v", passErr)
 		}
 		privateKey, err = depot.GetEncryptedPrivateKey(d, c.ca, pass)
 		if err != nil {
@@ -124,18 +131,32 @@ func (c *revokeCommand) saveRevokedCertificates(ctx *cli.Context, cert *x509.Cer
 		}
 	}
 
-	signer, ok := privateKey.Private.(crypto.Signer)
-	if !ok {
-		return errors.New("could not create CRL: CA private key does not implement crypto.Signer")
+	signer, err := privateKey.Signer()
+	if err != nil {
+		return fmt.Errorf("could not create CRL: %v", err)
 	}
+	publicKey, err := privateKey.PublicKey()
+	if err != nil {
+		return fmt.Errorf("could not create CRL: %v", err)
+	}
+	match, err := pkix.PublicKeysEqual(cert.PublicKey, publicKey)
+	if err != nil {
+		return fmt.Errorf("could not create CRL: %v", err)
+	}
+	if !match {
+		return errors.New("could not create CRL: CA private key does not match CA certificate")
+	}
+
 	crlBytes, err := x509.CreateRevocationList(rand.Reader, template, cert, signer)
 	if err != nil {
 		return fmt.Errorf("could not create CRL: %v", err)
 	}
-	if err := d.Delete(depot.CrlTag(c.ca)); err != nil {
-		return fmt.Errorf("could not delete CRL: %v", err)
+
+	txn := depot.NewTxn(d)
+	if err = depot.ReplaceCertificateRevocationListInTxn(txn, c.ca, pkix.NewCertificateRevocationListFromDER(crlBytes)); err != nil {
+		return fmt.Errorf("could not put revokation list: %v", err)
 	}
-	if err = depot.PutCertificateRevocationList(d, c.ca, pkix.NewCertificateRevocationListFromDER(crlBytes)); err != nil {
+	if err = txn.Commit(); err != nil {
 		return fmt.Errorf("could not put revokation list: %v", err)
 	}
 	return nil

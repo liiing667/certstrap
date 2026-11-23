@@ -30,6 +30,10 @@ const (
 	certificatePEMBlockType = "CERTIFICATE"
 )
 
+// ErrCertificateKeyMismatch reports that a certificate and private key do not
+// describe the same public identity.
+var ErrCertificateKeyMismatch = errors.New("certificate public key does not match private key")
+
 // Certificate is a wrapper around a x509 Certificate and its DER-formatted bytes
 type Certificate struct {
 	// derBytes is always set for valid Certificate
@@ -82,6 +86,37 @@ func (c *Certificate) GetRawCertificate() (*x509.Certificate, error) {
 		return nil, err
 	}
 	return c.crt, nil
+}
+
+// PublicKeyMatches reports whether key's public half is the public key in c.
+// It is used to bind a certificate to the private key that is allowed to use
+// it, so a key migration cannot silently pair a new algorithm with old
+// certificate material.
+func (c *Certificate) PublicKeyMatches(key *Key) (bool, error) {
+	if c == nil {
+		return false, errors.New("certificate is missing")
+	}
+	raw, err := c.GetRawCertificate()
+	if err != nil {
+		return false, fmt.Errorf("parse certificate public key: %w", err)
+	}
+	pub, err := key.PublicKey()
+	if err != nil {
+		return false, err
+	}
+	return PublicKeysEqual(raw.PublicKey, pub)
+}
+
+// ValidateKey verifies that key is usable and matches c's public key.
+func (c *Certificate) ValidateKey(key *Key) error {
+	match, err := c.PublicKeyMatches(key)
+	if err != nil {
+		return err
+	}
+	if !match {
+		return ErrCertificateKeyMismatch
+	}
+	return nil
 }
 
 // GetExpirationDuration gets time duration before expiration
@@ -149,6 +184,9 @@ func (c *Certificate) VerifyHost(hostCert *Certificate, name string) error {
 
 // Export returns PEM-format bytes
 func (c *Certificate) Export() ([]byte, error) {
+	if c == nil {
+		return nil, errors.New("certificate is missing")
+	}
 	pemBlock := &pem.Block{
 		Type:    certificatePEMBlockType,
 		Headers: nil,

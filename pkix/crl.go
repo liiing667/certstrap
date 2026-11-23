@@ -24,6 +24,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"time"
 )
@@ -36,6 +37,10 @@ const (
 // key and valid until expiry. It is the CA's first CRL, so its CRL number is 1.
 // The CA certificate must have a subject key ID and the CRL signing key usage.
 func CreateCertificateRevocationList(key *Key, ca *Certificate, expiry time.Time) (*CertificateRevocationList, error) {
+	if err := ca.ValidateKey(key); err != nil {
+		return nil, fmt.Errorf("CA key does not match CA certificate (%s): %w", key.exportEvidence(), err)
+	}
+
 	rawCrt, err := ca.GetRawCertificate()
 	if err != nil {
 		return nil, err

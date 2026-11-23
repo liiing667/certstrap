@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -130,9 +131,19 @@ func newSignAction(c *cli.Context) {
 
 	key, err := depot.GetPrivateKey(d, formattedCAName)
 	if err != nil {
-		pass, err := getPassPhrase(c, "CA key")
-		if err != nil {
+		var identityErr *depot.StoredIdentityError
+		if errors.As(err, &identityErr) {
 			fmt.Fprintln(os.Stderr, "Get CA key error: ", err)
+			os.Exit(1)
+		}
+		encrypted, encryptedErr := depot.IsEncryptedPrivateKey(d, formattedCAName)
+		if encryptedErr != nil || !encrypted {
+			fmt.Fprintln(os.Stderr, "Get CA key error: ", err)
+			os.Exit(1)
+		}
+		pass, passErr := getPassPhrase(c, "CA key")
+		if passErr != nil {
+			fmt.Fprintln(os.Stderr, "Get CA key error: ", passErr)
 			os.Exit(1)
 		}
 		key, err = depot.GetEncryptedPrivateKey(d, formattedCAName, pass)
@@ -163,21 +174,29 @@ func newSignAction(c *cli.Context) {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Create certificate error:", err)
 		os.Exit(1)
-	} else {
-		fmt.Printf("Created %s/%s.crt from %s/%s.csr signed by %s/%s.key\n", depotDir, formattedReqName, depotDir, formattedReqName, depotDir, formattedCAName)
 	}
 
+	var crtBytes []byte
 	if c.Bool("stdout") {
-		crtBytes, err := crtOut.Export()
+		crtBytes, err = crtOut.Export()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Print certificate error:", err)
 			os.Exit(1)
-		} else {
-			fmt.Println(string(crtBytes))
 		}
 	}
 
-	if err = putCertificate(c, d, formattedReqName, crtOut); err != nil {
+	txn := depot.NewTxn(d)
+	if err = stageCertificate(c, txn, formattedReqName, crtOut); err != nil {
 		fmt.Fprintln(os.Stderr, "Save certificate error:", err)
+		os.Exit(1)
+	}
+	if err = txn.Commit(); err != nil {
+		fmt.Fprintln(os.Stderr, "Save certificate error:", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Created %s/%s.crt from %s/%s.csr signed by %s/%s.key\n", depotDir, formattedReqName, depotDir, formattedReqName, depotDir, formattedCAName)
+	if c.Bool("stdout") {
+		fmt.Println(string(crtBytes))
 	}
 }
