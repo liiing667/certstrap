@@ -113,21 +113,55 @@ func unmarshalExtension(ext x509pkix.Extension, value any) error {
 // recommends, and any other reason code is re-encoded as a non-critical
 // extension after the entry's other extensions, which can change their order.
 func nextRevocationList(current *x509.RevocationList, serial *big.Int, now time.Time) *x509.RevocationList {
+	return nextRevocationListFor(current, &x509.RevocationListEntry{
+		SerialNumber:   serial,
+		RevocationTime: now,
+	}, false, now)
+}
+
+// nextRevocationListFor returns the template for the CRL that replaces current.
+// When remove is false, entry is appended after the existing entries. When
+// remove is true, every existing entry with the same serial number is dropped
+// instead, which is how removeFromCRL is represented in a complete CRL.
+//
+// A nil current is treated as an empty CRL, which is how revoke creates a CRL
+// for a CA whose depot predates init's empty CRL.
+func nextRevocationListFor(current *x509.RevocationList, entry *x509.RevocationListEntry, remove bool, now time.Time) *x509.RevocationList {
+	if current == nil {
+		current = &x509.RevocationList{}
+	}
+
 	entries := make([]x509.RevocationListEntry, 0, len(current.RevokedCertificateEntries)+1)
-	for _, entry := range current.RevokedCertificateEntries {
+	for _, existing := range current.RevokedCertificateEntries {
+		if remove && entry != nil && entry.SerialNumber != nil && existing.SerialNumber != nil && existing.SerialNumber.Cmp(entry.SerialNumber) == 0 {
+			continue
+		}
+		extra := existing.ExtraExtensions
+		if len(extra) == 0 {
+			extra = existing.Extensions
+		}
+		entries = append(entries, x509.RevocationListEntry{
+			SerialNumber:   existing.SerialNumber,
+			RevocationTime: existing.RevocationTime,
+			// x509.CreateRevocationList encodes the reason code extension
+			// itself, and rejects it in ExtraExtensions.
+			ReasonCode:      existing.ReasonCode,
+			ExtraExtensions: withoutExtension(extra, oidExtensionReasonCode),
+		})
+	}
+	if !remove && entry != nil {
+		extra := entry.ExtraExtensions
+		if len(extra) == 0 {
+			extra = entry.Extensions
+		}
 		entries = append(entries, x509.RevocationListEntry{
 			SerialNumber:   entry.SerialNumber,
 			RevocationTime: entry.RevocationTime,
-			// x509.CreateRevocationList encodes the reason code extension
-			// itself, and rejects it in ExtraExtensions.
-			ReasonCode:      entry.ReasonCode,
-			ExtraExtensions: withoutExtension(entry.Extensions, oidExtensionReasonCode),
+			ReasonCode:     entry.ReasonCode,
+			// The reason code is always written from ReasonCode.
+			ExtraExtensions: withoutExtension(extra, oidExtensionReasonCode),
 		})
 	}
-	entries = append(entries, x509.RevocationListEntry{
-		SerialNumber:   serial,
-		RevocationTime: now,
-	})
 
 	number := big.NewInt(1)
 	if current.Number != nil && current.Number.Sign() > 0 {

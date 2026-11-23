@@ -173,10 +173,41 @@ func PutCertificateRevocationList(d Depot, name string, crl *pkix.CertificateRev
 	if err != nil {
 		return err
 	}
-	return d.Put(CrlTag(name), b)
+	return replaceTag(d, CrlTag(name), b)
 }
 
-//GetCertificateRevocationList gets a CRL file for a given name and ca in the depot.
+// ReplaceCertificateRevocationList creates or atomically replaces a CRL file
+// for a given name and ca in the depot.
+func ReplaceCertificateRevocationList(d Depot, name string, crl *pkix.CertificateRevocationList) error {
+	return PutCertificateRevocationList(d, name, crl)
+}
+
+// PutCertificateRevocationListInTxn stages creation of a new CRL file into t.
+func PutCertificateRevocationListInTxn(t *Txn, name string, crl *pkix.CertificateRevocationList) error {
+	b, err := crl.Export()
+	if err != nil {
+		return err
+	}
+	return t.Put(CrlTag(name), b)
+}
+
+// ReplaceCertificateRevocationListInTxn stages replacement of an existing CRL
+// file into t. The previous CRL is restored if the transaction fails.
+func ReplaceCertificateRevocationListInTxn(t *Txn, name string, crl *pkix.CertificateRevocationList) error {
+	b, err := crl.Export()
+	if err != nil {
+		return err
+	}
+	return t.Replace(CrlTag(name), b)
+}
+
+// CheckCertificateRevocationList checks the depot for existence of a CRL file
+// for a given CA name.
+func CheckCertificateRevocationList(d Depot, name string) bool {
+	return d.Check(CrlTag(name))
+}
+
+// GetCertificateRevocationList gets a CRL file for a given name and ca in the depot.
 func GetCertificateRevocationList(d Depot, name string) (*pkix.CertificateRevocationList, error) {
 	b, err := d.Get(CrlTag(name))
 	if err != nil {

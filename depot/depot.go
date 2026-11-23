@@ -71,6 +71,11 @@ func (d *FileDepot) path(name string) string {
 	return filepath.Join(d.dirPath, name)
 }
 
+// Dir returns the absolute path of the directory backing the depot.
+func (d *FileDepot) Dir() string {
+	return d.dirPath
+}
+
 // Put inserts the data into the file specified by the tag
 func (d *FileDepot) Put(tag *Tag, data []byte) error {
 	if data == nil {
@@ -96,6 +101,95 @@ func (d *FileDepot) Put(tag *Tag, data []byte) error {
 	}
 
 	file.Close()
+	return nil
+}
+
+// Replace atomically replaces the contents of the file specified by the tag.
+// The data is written to a temporary file in the depot and renamed into place,
+// so readers observe either the previous contents or the complete new
+// contents, never a partial write. If writing fails, the previous file is left
+// untouched.
+func (d *FileDepot) Replace(tag *Tag, data []byte) error {
+	if data == nil {
+		return errors.New("data is nil")
+	}
+
+	if err := os.MkdirAll(d.dirPath, 0755); err != nil {
+		return err
+	}
+
+	name := d.path(tag.name)
+	file, err := os.CreateTemp(d.dirPath, "."+filepath.Base(tag.name)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tempName := file.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = file.Close()
+			_ = removeDepotFile(tempName)
+		}
+	}()
+
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	if err := file.Chmod(tag.perm); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := replaceDepotFile(tempName, name); err != nil {
+		return err
+	}
+
+	committed = true
+	return nil
+}
+
+// removeDepotFile removes name, clearing a read-only mode first because
+// Windows does not allow removing read-only files.
+func removeDepotFile(name string) error {
+	if name == "" {
+		return nil
+	}
+	_ = os.Chmod(name, 0666)
+	return os.Remove(name)
+}
+
+// replaceTag stores data for the tag, replacing any previous contents. Depots
+// that implement Replace get an atomic replacement. For other implementations,
+// the previous contents are restored if the replacement fails.
+func replaceTag(d Depot, tag *Tag, data []byte) error {
+	if replacer, ok := d.(interface {
+		Replace(tag *Tag, data []byte) error
+	}); ok {
+		return replacer.Replace(tag, data)
+	}
+
+	err := d.Put(tag, data)
+	if err == nil || !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+
+	previous, err := d.Get(tag)
+	if err != nil {
+		return err
+	}
+	if err := d.Delete(tag); err != nil {
+		return err
+	}
+	if err := d.Put(tag, data); err != nil {
+		if restoreErr := d.Put(tag, previous); restoreErr != nil {
+			return fmt.Errorf("could not put %q: %w (could not restore previous contents: %v)", tag.name, err, restoreErr)
+		}
+		return err
+	}
 	return nil
 }
 
