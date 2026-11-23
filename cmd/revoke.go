@@ -132,11 +132,12 @@ func (c *revokeCommand) saveRevokedCertificates(ctx *cli.Context, cert *x509.Cer
 	if err != nil {
 		return fmt.Errorf("could not create CRL: %v", err)
 	}
-	if err := d.Delete(depot.CrlTag(c.ca)); err != nil {
-		return fmt.Errorf("could not delete CRL: %v", err)
-	}
-	if err = depot.PutCertificateRevocationList(d, c.ca, pkix.NewCertificateRevocationListFromDER(crlBytes)); err != nil {
+
+	// Replace the CRL inside a transaction so a write failure restores the
+	// previous CRL instead of leaving the CA without one.
+	txn := depot.NewTxn(d)
+	if err = depot.ReplaceCertificateRevocationListInTxn(txn, c.ca, pkix.NewCertificateRevocationListFromDER(crlBytes)); err != nil {
 		return fmt.Errorf("could not put revokation list: %v", err)
 	}
-	return nil
+	return txn.Commit()
 }

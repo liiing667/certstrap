@@ -159,6 +159,7 @@ func newCertAction(c *cli.Context) {
 
 	// generate new key if one doesn't exist already
 	var key *pkix.Key
+	keyCreated := false
 	keyFilepath := fileName(c, "key", depotDir, formattedName, "key")
 	switch {
 	case c.IsSet("key") && fileExists(c.String("key")):
@@ -181,53 +182,65 @@ func newCertAction(c *cli.Context) {
 			fmt.Fprintf(os.Stderr, "Create %s Key error: %v", curve, err)
 			os.Exit(1)
 		}
-		if len(passphrase) > 0 {
-			fmt.Printf("Created %s (encrypted by passphrase)\n", keyFilepath)
-		} else {
-			fmt.Printf("Created %s\n", keyFilepath)
-		}
+		keyCreated = true
 	default:
 		key, err = pkix.CreateRSAKey(c.Int("key-bits"))
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Create RSA Key error:", err)
 			os.Exit(1)
 		}
-		if len(passphrase) > 0 {
-			fmt.Printf("Created %s (encrypted by passphrase)\n", keyFilepath)
-		} else {
-			fmt.Printf("Created %s\n", keyFilepath)
-		}
+		keyCreated = true
 	}
 
 	csr, err := pkix.CreateCertificateSigningRequest(key, c.String("organizational-unit"), ips, domains, uris, c.String("organization"), c.String("country"), c.String("province"), c.String("locality"), name)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Create certificate request error:", err)
 		os.Exit(1)
-	} else {
-		fmt.Printf("Created %s\n", fileName(c, "csr", depotDir, formattedName, "csr"))
 	}
+
+	csrBytes, err := csr.Export()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Export certificate request error:", err)
+		os.Exit(1)
+	}
+
+	// Stage every output of this command into a single transaction. Neither
+	// the CSR nor the key is published until all writes can succeed, so a
+	// permission or disk failure cannot leave a request that looks complete.
+	txn := depot.NewTxn(d)
+	externalCsr, err := stageCertificateSigningRequest(c, txn, formattedName, csr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Save certificate request error:", err)
+		os.Exit(1)
+	}
+
+	var externalKey *externalWrite
+	if len(passphrase) > 0 {
+		externalKey, err = stageEncryptedPrivateKey(c, txn, formattedName, key, passphrase)
+	} else {
+		externalKey, err = stagePrivateKey(c, txn, formattedName, key)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Save private key error:", err)
+		os.Exit(1)
+	}
+
+	if err = commitTransaction(txn, externalCsr, externalKey); err != nil {
+		fmt.Fprintln(os.Stderr, "Save certificate request error:", err)
+		os.Exit(1)
+	}
+
+	if keyCreated {
+		if len(passphrase) > 0 {
+			fmt.Printf("Created %s (encrypted by passphrase)\n", keyFilepath)
+		} else {
+			fmt.Printf("Created %s\n", keyFilepath)
+		}
+	}
+	fmt.Printf("Created %s\n", fileName(c, "csr", depotDir, formattedName, "csr"))
 
 	if c.Bool("stdout") {
-		csrBytes, err := csr.Export()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Print certificate request error:", err)
-			os.Exit(1)
-		} else {
-			fmt.Println(string(csrBytes))
-		}
-	}
-
-	if err = putCertificateSigningRequest(c, d, formattedName, csr); err != nil {
-		fmt.Fprintln(os.Stderr, "Save certificate request error:", err)
-	}
-	if len(passphrase) > 0 {
-		if err = putEncryptedPrivateKey(c, d, formattedName, key, passphrase); err != nil {
-			fmt.Fprintln(os.Stderr, "Save encrypted private key error:", err)
-		}
-	} else {
-		if err = putPrivateKey(c, d, formattedName, key); err != nil {
-			fmt.Fprintln(os.Stderr, "Save private key error:", err)
-		}
+		fmt.Println(string(csrBytes))
 	}
 }
 

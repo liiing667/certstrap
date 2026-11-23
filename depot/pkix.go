@@ -79,6 +79,16 @@ func PutCertificate(d Depot, name string, crt *pkix.Certificate) error {
 	return d.Put(CrtTag(name), b)
 }
 
+// PutCertificateInTxn stages creation of a certificate file into t. The file
+// is only published when the transaction commits.
+func PutCertificateInTxn(t *Txn, name string, crt *pkix.Certificate) error {
+	b, err := crt.Export()
+	if err != nil {
+		return err
+	}
+	return t.Put(CrtTag(name), b)
+}
+
 // CheckCertificate checks the depot for existence of a certificate file for a given CA name
 func CheckCertificate(d Depot, name string) bool {
 	return d.Check(CrtTag(name))
@@ -105,6 +115,15 @@ func PutCertificateSigningRequest(d Depot, name string, csr *pkix.CertificateSig
 		return err
 	}
 	return d.Put(CsrTag(name), b)
+}
+
+// PutCertificateSigningRequestInTxn stages creation of a CSR file into t.
+func PutCertificateSigningRequestInTxn(t *Txn, name string, csr *pkix.CertificateSigningRequest) error {
+	b, err := csr.Export()
+	if err != nil {
+		return err
+	}
+	return t.Put(CsrTag(name), b)
 }
 
 // CheckCertificateSigningRequest checks the depot for existence of a certificate signing request file for a given host name
@@ -135,6 +154,15 @@ func PutPrivateKey(d Depot, name string, key *pkix.Key) error {
 	return d.Put(PrivKeyTag(name), b)
 }
 
+// PutPrivateKeyInTxn stages creation of a private key file into t.
+func PutPrivateKeyInTxn(t *Txn, name string, key *pkix.Key) error {
+	b, err := key.ExportPrivate()
+	if err != nil {
+		return err
+	}
+	return t.Put(PrivKeyTag(name), b)
+}
+
 // CheckPrivateKey checks the depot for existence of a private key file for a given name
 func CheckPrivateKey(d Depot, name string) bool {
 	return d.Check(PrivKeyTag(name))
@@ -158,6 +186,16 @@ func PutEncryptedPrivateKey(d Depot, name string, key *pkix.Key, passphrase []by
 	return d.Put(PrivKeyTag(name), b)
 }
 
+// PutEncryptedPrivateKeyInTxn stages creation of an encrypted private key
+// file into t.
+func PutEncryptedPrivateKeyInTxn(t *Txn, name string, key *pkix.Key, passphrase []byte) error {
+	b, err := key.ExportEncryptedPrivate(passphrase)
+	if err != nil {
+		return err
+	}
+	return t.Put(PrivKeyTag(name), b)
+}
+
 // GetEncryptedPrivateKey retrieves an encrypted private key file for a given name from the depot
 func GetEncryptedPrivateKey(d Depot, name string, passphrase []byte) (key *pkix.Key, err error) {
 	b, err := d.Get(PrivKeyTag(name))
@@ -176,7 +214,26 @@ func PutCertificateRevocationList(d Depot, name string, crl *pkix.CertificateRev
 	return d.Put(CrlTag(name), b)
 }
 
-//GetCertificateRevocationList gets a CRL file for a given name and ca in the depot.
+// ReplaceCertificateRevocationListInTxn stages replacement of an existing CRL
+// file. The previous CRL is restored if the transaction does not commit.
+func ReplaceCertificateRevocationListInTxn(t *Txn, name string, crl *pkix.CertificateRevocationList) error {
+	b, err := crl.Export()
+	if err != nil {
+		return err
+	}
+	return t.Replace(CrlTag(name), b)
+}
+
+// PutCertificateRevocationListInTxn stages creation of a new CRL file into t.
+func PutCertificateRevocationListInTxn(t *Txn, name string, crl *pkix.CertificateRevocationList) error {
+	b, err := crl.Export()
+	if err != nil {
+		return err
+	}
+	return t.Put(CrlTag(name), b)
+}
+
+// GetCertificateRevocationList gets a CRL file for a given name and ca in the depot.
 func GetCertificateRevocationList(d Depot, name string) (*pkix.CertificateRevocationList, error) {
 	b, err := d.Get(CrlTag(name))
 	if err != nil {

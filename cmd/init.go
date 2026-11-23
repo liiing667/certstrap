@@ -150,6 +150,7 @@ func initAction(c *cli.Context) {
 	}
 
 	var key *pkix.Key
+	keyCreated := false
 	switch {
 	case c.IsSet("key"):
 		keyBytes, err := os.ReadFile(c.String("key"))
@@ -171,22 +172,14 @@ func initAction(c *cli.Context) {
 			fmt.Fprintf(os.Stderr, "Create %s Key error: %v\n", curve, err)
 			os.Exit(1)
 		}
-		if len(passphrase) > 0 {
-			fmt.Printf("Created %s/%s.key (encrypted by passphrase)\n", depotDir, formattedName)
-		} else {
-			fmt.Printf("Created %s/%s.key\n", depotDir, formattedName)
-		}
+		keyCreated = true
 	default:
 		key, err = pkix.CreateRSAKey(c.Int("key-bits"))
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Create RSA Key error:", err)
 			os.Exit(1)
 		}
-		if len(passphrase) > 0 {
-			fmt.Printf("Created %s/%s.key (encrypted by passphrase)\n", depotDir, formattedName)
-		} else {
-			fmt.Printf("Created %s/%s.key\n", depotDir, formattedName)
-		}
+		keyCreated = true
 	}
 
 	opts := []pkix.Option{
@@ -199,30 +192,6 @@ func initAction(c *cli.Context) {
 		fmt.Fprintln(os.Stderr, "Create certificate error:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Created %s/%s.crt\n", depotDir, formattedName)
-
-	if c.Bool("stdout") {
-		crtBytes, err := crt.Export()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Print CA certificate error:", err)
-			os.Exit(1)
-		} else {
-			fmt.Println(string(crtBytes))
-		}
-	}
-
-	if err = depot.PutCertificate(d, formattedName, crt); err != nil {
-		fmt.Fprintln(os.Stderr, "Save certificate error:", err)
-	}
-	if len(passphrase) > 0 {
-		if err = depot.PutEncryptedPrivateKey(d, formattedName, key, passphrase); err != nil {
-			fmt.Fprintln(os.Stderr, "Save encrypted private key error:", err)
-		}
-	} else {
-		if err = depot.PutPrivateKey(d, formattedName, key); err != nil {
-			fmt.Fprintln(os.Stderr, "Save private key error:", err)
-		}
-	}
 
 	// Create an empty CRL, this is useful for Java apps which mandate a CRL.
 	crl, err := pkix.CreateCertificateRevocationList(key, crt, expiresTime)
@@ -230,9 +199,52 @@ func initAction(c *cli.Context) {
 		fmt.Fprintln(os.Stderr, "Create CRL error:", err)
 		os.Exit(1)
 	}
-	if err = depot.PutCertificateRevocationList(d, formattedName, crl); err != nil {
+
+	crtBytes, err := crt.Export()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Export CA certificate error:", err)
+		os.Exit(1)
+	}
+
+	// Stage the certificate, key and CRL together. The CA only exists once
+	// all three files are published, so a failed write cannot leave a depot
+	// holding a partial CA generation.
+	txn := depot.NewTxn(d)
+	if err = depot.PutCertificateInTxn(txn, formattedName, crt); err != nil {
+		fmt.Fprintln(os.Stderr, "Save certificate error:", err)
+		os.Exit(1)
+	}
+	if len(passphrase) > 0 {
+		if err = depot.PutEncryptedPrivateKeyInTxn(txn, formattedName, key, passphrase); err != nil {
+			fmt.Fprintln(os.Stderr, "Save encrypted private key error:", err)
+			os.Exit(1)
+		}
+	} else {
+		if err = depot.PutPrivateKeyInTxn(txn, formattedName, key); err != nil {
+			fmt.Fprintln(os.Stderr, "Save private key error:", err)
+			os.Exit(1)
+		}
+	}
+	if err = depot.PutCertificateRevocationListInTxn(txn, formattedName, crl); err != nil {
 		fmt.Fprintln(os.Stderr, "Save CRL error:", err)
 		os.Exit(1)
 	}
+	if err = txn.Commit(); err != nil {
+		fmt.Fprintln(os.Stderr, "Save CA error:", err)
+		os.Exit(1)
+	}
+
+	if keyCreated {
+		if len(passphrase) > 0 {
+			fmt.Printf("Created %s/%s.key (encrypted by passphrase)\n", depotDir, formattedName)
+		} else {
+			fmt.Printf("Created %s/%s.key\n", depotDir, formattedName)
+		}
+	}
+	fmt.Printf("Created %s/%s.crt\n", depotDir, formattedName)
 	fmt.Printf("Created %s/%s.crl\n", depotDir, formattedName)
+
+	if c.Bool("stdout") {
+		fmt.Println(string(crtBytes))
+	}
 }

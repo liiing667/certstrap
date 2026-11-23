@@ -163,21 +163,31 @@ func newSignAction(c *cli.Context) {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Create certificate error:", err)
 		os.Exit(1)
-	} else {
-		fmt.Printf("Created %s/%s.crt from %s/%s.csr signed by %s/%s.key\n", depotDir, formattedReqName, depotDir, formattedReqName, depotDir, formattedCAName)
 	}
+
+	// The certificate was built in memory, but nothing has been written yet.
+	// Do not claim success until the commit below is durable.
+	crtBytes, err := crtOut.Export()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Export certificate error:", err)
+		os.Exit(1)
+	}
+
+	txn := depot.NewTxn(d)
+	externalCrt, err := stageCertificate(c, txn, formattedReqName, crtOut)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Save certificate error:", err)
+		os.Exit(1)
+	}
+
+	if err = commitTransaction(txn, externalCrt); err != nil {
+		fmt.Fprintln(os.Stderr, "Save certificate error:", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Created %s/%s.crt from %s/%s.csr signed by %s/%s.key\n", depotDir, formattedReqName, depotDir, formattedReqName, depotDir, formattedCAName)
 
 	if c.Bool("stdout") {
-		crtBytes, err := crtOut.Export()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Print certificate error:", err)
-			os.Exit(1)
-		} else {
-			fmt.Println(string(crtBytes))
-		}
-	}
-
-	if err = putCertificate(c, d, formattedReqName, crtOut); err != nil {
-		fmt.Fprintln(os.Stderr, "Save certificate error:", err)
+		fmt.Println(string(crtBytes))
 	}
 }
