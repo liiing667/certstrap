@@ -151,6 +151,9 @@ func (d *FileDepot) List() []*Tag {
 		if info.IsDir() {
 			return nil
 		}
+		if info.Name() == lockFileName {
+			return nil
+		}
 		rel, err := filepath.Rel(d.dirPath, path)
 		if err != nil {
 			return nil
