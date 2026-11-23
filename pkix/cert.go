@@ -109,6 +109,12 @@ func (c *Certificate) CheckAuthority() error {
 //         CA
 //  host1 host2 host3
 func (c *Certificate) VerifyHost(hostCert *Certificate, name string) error {
+	return c.VerifyHostAt(hostCert, name, time.Now())
+}
+
+// VerifyHostAt verifies the host certificate using the supplied time snapshot.
+// Only a certificate authority may call this function successfully.
+func (c *Certificate) VerifyHostAt(hostCert *Certificate, name string, currentTime time.Time) error {
 	if err := c.CheckAuthority(); err != nil {
 		return err
 	}
@@ -121,8 +127,7 @@ func (c *Certificate) VerifyHost(hostCert *Certificate, name string) error {
 		// no intermediates are allowed for now
 		Intermediates: nil,
 		Roots:         roots,
-		// if zero, the current time is used
-		CurrentTime: time.Now(),
+		CurrentTime:   currentTime,
 		// An empty list means ExtKeyUsageServerAuth.
 		KeyUsages: nil,
 	}

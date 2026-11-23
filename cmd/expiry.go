@@ -4,13 +4,28 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
 var nowFunc = time.Now
 
 func parseExpiry(fromNow string) (time.Time, error) {
-	now := nowFunc().UTC()
+	return parseExpiryAt(fromNow, nowFunc())
+}
+
+// parseExpiryAt parses an expiry relative to a single, caller-supplied
+// timestamp. Signing uses this so that the requested lifetime is measured from
+// exactly the same snapshot as the issuer and leaf validity windows.
+func parseExpiryAt(fromNow string, now time.Time) (time.Time, error) {
+	now = now.UTC()
+	// A negative component would silently turn into a positive one below
+	// because the tokenizer only matches unsigned numbers. Reject it rather
+	// than accepting a backwards validity window.
+	if strings.Contains(fromNow, "-") {
+		return now, fmt.Errorf("invalid or empty format")
+	}
+
 	re := regexp.MustCompile(`\s*(\d+)\s*(day|month|year|hour|minute|second)s?`)
 	matches := re.FindAllStringSubmatch(fromNow, -1)
 	addDate := map[string]int{
@@ -45,7 +60,7 @@ func parseExpiry(fromNow string) (time.Time, error) {
 		Add(time.Duration(addDate["minute"]) * time.Minute).
 		Add(time.Duration(addDate["second"]) * time.Second)
 
-	if now == result {
+	if !result.After(now) {
 		return now, fmt.Errorf("invalid or empty format")
 	}
 

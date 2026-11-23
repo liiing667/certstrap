@@ -112,6 +112,9 @@ func initAction(c *cli.Context) {
 		os.Exit(1)
 	}
 
+	// Capture one issuance snapshot for the CA validity window.
+	issuedAt := nowFunc().UTC()
+
 	formattedName := strings.Replace(c.String("common-name"), " ", "_", -1)
 
 	if depot.CheckCertificate(d, formattedName) || depot.CheckPrivateKey(d, formattedName) {
@@ -132,7 +135,7 @@ func initAction(c *cli.Context) {
 
 	// Expiry parsing is a naive regex implementation
 	// Token based parsing would provide better feedback but
-	expiresTime, err := parseExpiry(expires)
+	expiresTime, err := parseExpiryAt(expires, issuedAt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid expiry: %s\n", err)
 		os.Exit(1)
@@ -193,7 +196,7 @@ func initAction(c *cli.Context) {
 		pkix.WithPathlenOption(c.Int("path-length"), c.Bool("exclude-path-length")),
 	}
 
-	crt, err := pkix.CreateCertificateAuthorityWithOptions(key, c.String("organizational-unit"), expiresTime, c.String("organization"), c.String("country"), c.String("province"), c.String("locality"), c.String("common-name"), c.StringSlice("permit-domain"), opts...)
+	crt, err := pkix.CreateCertificateAuthorityWithOptionsAt(key, c.String("organizational-unit"), expiresTime, issuedAt, c.String("organization"), c.String("country"), c.String("province"), c.String("locality"), c.String("common-name"), c.StringSlice("permit-domain"), opts...)
 
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Create certificate error:", err)

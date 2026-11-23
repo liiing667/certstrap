@@ -20,6 +20,7 @@ package pkix
 import (
 	"crypto/rand"
 	"crypto/x509"
+	"errors"
 	"math/big"
 	"time"
 )
@@ -36,14 +37,24 @@ func CreateCertificateAuthority(key *Key, organizationalUnit string, expiry time
 // CreateCertificateAuthorityWithOptions creates Certificate Authority using existing key with options.
 // CertificateAuthorityInfo returned is the extra infomation required by Certificate Authority.
 func CreateCertificateAuthorityWithOptions(key *Key, organizationalUnit string, expiry time.Time, organization string, country string, province string, locality string, commonName string, permitDomains []string, opts ...Option) (*Certificate, error) {
-	authTemplate := newAuthTemplate()
+	return CreateCertificateAuthorityWithOptionsAt(key, organizationalUnit, expiry, time.Now().UTC(), organization, country, province, locality, commonName, permitDomains, opts...)
+}
+
+// CreateCertificateAuthorityWithOptionsAt creates a Certificate Authority
+// using one caller-supplied issuance-time snapshot for its validity window.
+func CreateCertificateAuthorityWithOptionsAt(key *Key, organizationalUnit string, expiry time.Time, issuedAt time.Time, organization string, country string, province string, locality string, commonName string, permitDomains []string, opts ...Option) (*Certificate, error) {
+	issuedAt = issuedAt.UTC()
+	if issuedAt.IsZero() {
+		return nil, errors.New("issuance time is zero")
+	}
+
+	authTemplate := newAuthTemplateAt(issuedAt.Add(-certificateBackdate), expiry)
 
 	subjectKeyID, err := GenerateSubjectKeyID(key.Public)
 	if err != nil {
 		return nil, err
 	}
 	authTemplate.SubjectKeyId = subjectKeyID
-	authTemplate.NotAfter = expiry
 	if len(country) > 0 {
 		authTemplate.Subject.Country = []string{country}
 	}
@@ -88,7 +99,23 @@ func CreateIntermediateCertificateAuthority(crtAuth *Certificate, keyAuth *Key, 
 // CreateIntermediateCertificateAuthorityWithOptions creates an intermediate with options.
 // CA certificate signed by the given authority.
 func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest, proposedExpiry time.Time, opts ...Option) (*Certificate, error) {
-	authTemplate := newAuthTemplate()
+	return CreateIntermediateCertificateAuthorityWithOptionsAt(crtAuth, keyAuth, csr, proposedExpiry, time.Now().UTC(), opts...)
+}
+
+// CreateIntermediateCertificateAuthorityWithOptionsAt creates an intermediate
+// CA signed by the given authority using a single issuance-time snapshot.
+func CreateIntermediateCertificateAuthorityWithOptionsAt(crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest, proposedExpiry time.Time, issuedAt time.Time, opts ...Option) (*Certificate, error) {
+	rawCrtAuth, err := crtAuth.GetRawCertificate()
+	if err != nil {
+		return nil, err
+	}
+
+	notBefore, notAfter, err := issuanceWindow(rawCrtAuth, proposedExpiry, issuedAt)
+	if err != nil {
+		return nil, err
+	}
+
+	authTemplate := newAuthTemplateAt(notBefore, notAfter)
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
@@ -104,14 +131,6 @@ func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, key
 
 	authTemplate.RawSubject = rawCsr.RawSubject
 
-	caExpiry := time.Now().Add(crtAuth.GetExpirationDuration())
-	// ensure cert doesn't expire after issuer
-	if caExpiry.Before(proposedExpiry) {
-		authTemplate.NotAfter = caExpiry
-	} else {
-		authTemplate.NotAfter = proposedExpiry
-	}
-
 	authTemplate.SubjectKeyId, err = GenerateSubjectKeyID(rawCsr.PublicKey)
 	if err != nil {
 		return nil, err
@@ -121,11 +140,6 @@ func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, key
 	authTemplate.DNSNames = rawCsr.DNSNames
 	authTemplate.URIs = rawCsr.URIs
 
-	rawCrtAuth, err := crtAuth.GetRawCertificate()
-	if err != nil {
-		return nil, err
-	}
-
 	applyOptions(&authTemplate, opts)
 
 	crtOutBytes, err := x509.CreateCertificate(rand.Reader, &authTemplate, rawCrtAuth, rawCsr.PublicKey, keyAuth.Private)
@@ -133,7 +147,15 @@ func CreateIntermediateCertificateAuthorityWithOptions(crtAuth *Certificate, key
 		return nil, err
 	}
 
-	return NewCertificateFromDER(crtOutBytes), nil
+	crtOut := NewCertificateFromDER(crtOutBytes)
+	rawCrtOut, err := crtOut.GetRawCertificate()
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyIssuedCertificateAt(rawCrtOut, rawCrtAuth, issuedAt); err != nil {
+		return nil, err
+	}
+	return crtOut, nil
 }
 
 // WithPathlenOption will check if the certificate should have `pathlen` or not.
@@ -153,13 +175,12 @@ func applyOptions(template *x509.Certificate, opts []Option) {
 	}
 }
 
-func newAuthTemplate() x509.Certificate {
+func newAuthTemplateAt(notBefore, notAfter time.Time) x509.Certificate {
 	// Build CA based on RFC5280
 	return x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		// NotBefore is set to be 10min earlier to fix gap on time difference in cluster
-		NotBefore: time.Now().Add(-10 * time.Minute).UTC(),
-		NotAfter:  time.Time{},
+		NotBefore:    notBefore.UTC(),
+		NotAfter:     notAfter.UTC(),
 		// Used for certificate signing only
 		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 

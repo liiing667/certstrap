@@ -83,6 +83,11 @@ func newSignAction(c *cli.Context) {
 		os.Exit(1)
 	}
 
+	// Capture the signing clock exactly once. Expiry parsing, the issuer
+	// window, the leaf window, certificate serialization and the final chain
+	// verification all use this one snapshot.
+	issuedAt := nowFunc().UTC()
+
 	formattedReqName := strings.Replace(c.Args()[0], " ", "_", -1)
 	formattedCAName := strings.Replace(c.String("CA"), " ", "_", -1)
 
@@ -98,7 +103,7 @@ func newSignAction(c *cli.Context) {
 
 	// Expiry parsing is a naive regex implementation
 	// Token based parsing would provide better feedback but
-	expiresTime, err := parseExpiry(expires)
+	expiresTime, err := parseExpiryAt(expires, issuedAt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid expiry: %s\n", err)
 		os.Exit(1)
@@ -127,6 +132,10 @@ func newSignAction(c *cli.Context) {
 		fmt.Fprintln(os.Stderr, "Selected CA certificate is not allowed to sign certificates.")
 		os.Exit(1)
 	}
+	if err := pkix.CheckIssuerValidityAt(raw_crt, issuedAt); err != nil {
+		fmt.Fprintln(os.Stderr, "Selected CA certificate is not valid at signing time:", err)
+		os.Exit(1)
+	}
 
 	key, err := depot.GetPrivateKey(d, formattedCAName)
 	if err != nil {
@@ -150,34 +159,44 @@ func newSignAction(c *cli.Context) {
 			pkix.WithPathlenOption(c.Int("path-length"), false),
 		}
 
-		crtOut, err = pkix.CreateIntermediateCertificateAuthorityWithOptions(crt, key, csr, expiresTime, opts...)
+		crtOut, err = pkix.CreateIntermediateCertificateAuthorityWithOptionsAt(crt, key, csr, expiresTime, issuedAt, opts...)
 	} else {
 		if c.IsSet("path-length") {
 			fmt.Fprintln(os.Stderr, "The 'path-length' can only be used with 'intermediate' flag.")
 			os.Exit(1)
 		}
 
-		crtOut, err = pkix.CreateCertificateHost(crt, key, csr, expiresTime)
+		crtOut, err = pkix.CreateCertificateHostAt(crt, key, csr, expiresTime, issuedAt)
 	}
 
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Create certificate error:", err)
 		os.Exit(1)
-	} else {
-		fmt.Printf("Created %s/%s.crt from %s/%s.csr signed by %s/%s.key\n", depotDir, formattedReqName, depotDir, formattedReqName, depotDir, formattedCAName)
 	}
 
-	if c.Bool("stdout") {
-		crtBytes, err := crtOut.Export()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Print certificate error:", err)
-			os.Exit(1)
-		} else {
-			fmt.Println(string(crtBytes))
-		}
+	// Verify the final chain with the same clock snapshot before publishing
+	// anything. A failed or retried invocation therefore cannot leave a
+	// half certificate behind.
+	if err := pkix.VerifyIssuedCertificateAt(crtOut, crt, issuedAt); err != nil {
+		fmt.Fprintln(os.Stderr, "Certificate chain verification error:", err)
+		os.Exit(1)
 	}
 
+	// Serialize once so the file and stdout are the exact certificate that was
+	// verified above.
+	crtBytes, err := crtOut.Export()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Print certificate error:", err)
+		os.Exit(1)
+	}
 	if err = putCertificate(c, d, formattedReqName, crtOut); err != nil {
 		fmt.Fprintln(os.Stderr, "Save certificate error:", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Created %s/%s.crt from %s/%s.csr signed by %s/%s.key\n", depotDir, formattedReqName, depotDir, formattedReqName, depotDir, formattedCAName)
+
+	if c.Bool("stdout") {
+		fmt.Println(string(crtBytes))
 	}
 }

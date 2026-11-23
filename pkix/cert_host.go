@@ -28,16 +28,32 @@ import (
 // CreateCertificateHost creates certificate for host.
 // The arguments include CA certificate, CA key, certificate request.
 func CreateCertificateHost(crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest, proposedExpiry time.Time) (*Certificate, error) {
+	return CreateCertificateHostAt(crtAuth, keyAuth, csr, proposedExpiry, time.Now().UTC())
+}
+
+// CreateCertificateHostAt creates a certificate for host using a single
+// issuance-time snapshot for the issuer window, the leaf window and the final
+// chain verification.
+func CreateCertificateHostAt(crtAuth *Certificate, keyAuth *Key, csr *CertificateSigningRequest, proposedExpiry, issuedAt time.Time) (*Certificate, error) {
+	rawCrtAuth, err := crtAuth.GetRawCertificate()
+	if err != nil {
+		return nil, err
+	}
+
+	notBefore, notAfter, err := issuanceWindow(rawCrtAuth, proposedExpiry, issuedAt)
+	if err != nil {
+		return nil, err
+	}
+
 	// Build CA based on RFC5280
 	hostTemplate := x509.Certificate{
 		// **SHOULD** be filled in a unique number
 		SerialNumber: big.NewInt(0),
 		// **SHOULD** be filled in host info
 		Subject: pkix.Name{},
-		// NotBefore is set to be 10min earlier to fix gap on time difference in cluster
-		NotBefore: time.Now().Add(-10*time.Minute).UTC(),
-		// 10-year lease
-		NotAfter: time.Time{},
+		// The whole validity window comes from the issuance snapshot.
+		NotBefore: notBefore,
+		NotAfter:  notAfter,
 		// Used for certificate signing only
 		KeyUsage: x509.KeyUsageKeyEncipherment | x509.KeyUsageDataEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageKeyAgreement,
 
@@ -78,14 +94,6 @@ func CreateCertificateHost(crtAuth *Certificate, keyAuth *Key, csr *CertificateS
 	// RawSubject has a value.
 	hostTemplate.RawSubject = rawCsr.RawSubject
 
-	caExpiry := time.Now().Add(crtAuth.GetExpirationDuration())
-	// ensure cert doesn't expire after issuer
-	if caExpiry.Before(proposedExpiry) {
-		hostTemplate.NotAfter = caExpiry
-	} else {
-		hostTemplate.NotAfter = proposedExpiry
-	}
-
 	hostTemplate.SubjectKeyId, err = GenerateSubjectKeyID(rawCsr.PublicKey)
 	if err != nil {
 		return nil, err
@@ -95,15 +103,18 @@ func CreateCertificateHost(crtAuth *Certificate, keyAuth *Key, csr *CertificateS
 	hostTemplate.DNSNames = rawCsr.DNSNames
 	hostTemplate.URIs = rawCsr.URIs
 
-	rawCrtAuth, err := crtAuth.GetRawCertificate()
-	if err != nil {
-		return nil, err
-	}
-
 	crtHostBytes, err := x509.CreateCertificate(rand.Reader, &hostTemplate, rawCrtAuth, rawCsr.PublicKey, keyAuth.Private)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewCertificateFromDER(crtHostBytes), nil
+	crtOut := NewCertificateFromDER(crtHostBytes)
+	rawCrtOut, err := crtOut.GetRawCertificate()
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyIssuedCertificateAt(rawCrtOut, rawCrtAuth, issuedAt); err != nil {
+		return nil, err
+	}
+	return crtOut, nil
 }
